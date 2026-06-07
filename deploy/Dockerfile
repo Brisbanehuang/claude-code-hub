@@ -24,6 +24,9 @@ ENV DSN="postgres://placeholder:placeholder@localhost:5432/placeholder"
 ENV REDIS_URL="redis://localhost:6379"
 # 标记为 CI 环境，跳过 instrumentation.ts 中的数据库连接
 ENV CI=true
+# `bun run build` already runs tsgo before next build; avoid Next's duplicate
+# typecheck in Docker to reduce peak memory for linux/amd64 image builds.
+ENV CCH_SKIP_NEXT_TYPECHECK=1
 
 RUN bun run build
 
@@ -48,7 +51,7 @@ RUN apt-get update && \
     apt-get update && \
     apt-get install -y --no-install-recommends postgresql-client-18 && \
     apt-get purge -y --auto-remove gnupg && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    find /var/lib/apt/lists /tmp /var/tmp -mindepth 1 -delete
 
 COPY --from=build --chown=node:node /app/public ./public
 COPY --from=build --chown=node:node /app/drizzle ./drizzle
@@ -58,7 +61,9 @@ COPY --from=build --chown=node:node /app/.next/standalone ./
 COPY --from=build --chown=node:node /app/.next/server ./.next/server
 COPY --from=build --chown=node:node /app/.next/static ./.next/static
 
+RUN mkdir -p /app/reports && chown node:node /app/reports
+
 USER node
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["node", "--report-on-fatalerror", "--report-uncaught-exception", "--diagnostic-dir=/app/reports", "--heapsnapshot-near-heap-limit=2", "server.js"]
