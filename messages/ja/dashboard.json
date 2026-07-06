@@ -274,6 +274,7 @@
         "jsonErrorNonEmpty": "JSON の `error` フィールドが空ではありません",
         "jsonErrorMessageNonEmpty": "JSON の `error.message` が空ではありません",
         "jsonMessageKeywordMatch": "JSON の `message` に \"error\" が含まれています (ヒューリスティック)",
+        "openAIResponseFailed": "OpenAI Responses の終端イベントが failed を報告しています",
         "unknown": "レスポンス本文がエラーを示しています"
       },
       "statusCodeInferredBadge": "推定",

@@ -274,6 +274,7 @@
         "jsonErrorNonEmpty": "В JSON непустое поле `error`",
         "jsonErrorMessageNonEmpty": "В JSON непустое `error.message`",
         "jsonMessageKeywordMatch": "В JSON `message` содержит слово \"error\" (эвристика)",
+        "openAIResponseFailed": "Финальное событие OpenAI Responses сообщает о failed",
         "unknown": "Тело ответа указывает на ошибку"
       },
       "statusCodeInferredBadge": "Предположено",
