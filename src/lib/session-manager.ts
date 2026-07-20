@@ -25,7 +25,17 @@ import type {
   SessionUsageUpdate,
 } from "@/types/session";
 import type { SpecialSetting } from "@/types/special-settings";
-import { getRedisClient } from "./redis";
+import {
+  getRedisClient,
+  getRedisConnectionGeneration,
+} from "./redis";
+import {
+  CAS_SESSION_BINDING,
+  CLEAR_SESSION_BINDING_AND_COOLDOWN,
+  PROBE_VERSIONED_SESSION_BINDING,
+  READ_OR_RECONCILE_SESSION_BINDING,
+} from "./redis/lua-scripts";
+import type Redis from "ioredis";
 import {
   getGlobalActiveSessionsKey,
   getKeyActiveSessionsKey,
@@ -201,7 +211,62 @@ function parseSessionDetailResponseMeta(value: string): SessionDetailResponseMet
  * 3. 支持客户端主动传递 session_id
  * 4. 存储和查询活跃 session 详细信息（用于实时监控）
  */
+export type SessionBindingSnapshotStatus = "ok" | "unavailable";
+
+export type SessionBindingSnapshot = {
+  status: SessionBindingSnapshotStatus;
+  binding: {
+    providerId: number | null;
+    keyId: number;
+    generation: string;
+  } | null;
+  discoveryEligible: boolean;
+  reason: string;
+};
+
+type VersionedCapability = "unknown" | "available" | "unavailable";
+
+type VersionedBindingKeys = {
+  binding: string;
+  legacyProvider: string;
+  legacyKey: string;
+  lease: string;
+  cooldown: string;
+};
+
+function buildVersionedBindingKeys(sessionId: string, keyId: number): VersionedBindingKeys {
+  const scope = Buffer.from(`${keyId}:${sessionId}`).toString("base64url");
+  const prefix = `session-binding:${scope}`;
+  return {
+    binding: `${prefix}:binding`,
+    legacyProvider: `session:${sessionId}:provider`,
+    legacyKey: `session:${sessionId}:key`,
+    lease: `${prefix}:lease`,
+    cooldown: `${prefix}:cooldown`,
+  };
+}
+
+function randomGeneration(): string {
+  return crypto.randomBytes(16).toString("hex");
+}
+
+function parseLuaJson(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "string") return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export class SessionManager {
+  private static versionedCapability: VersionedCapability = "unknown";
+  private static versionedCapabilityClient: Redis | null = null;
+  private static versionedCapabilityConnectionGeneration = -1;
+  private static versionedCapabilityPromise: Promise<boolean> | null = null;
   private static readonly SESSION_TTL = parseInt(process.env.SESSION_TTL || "300", 10); // 5 分钟
   private static readonly SHORT_CONTEXT_THRESHOLD = parseInt(
     process.env.SHORT_CONTEXT_THRESHOLD || "2",
@@ -606,6 +671,236 @@ export class SessionManager {
       await pipeline.exec();
     } catch (error) {
       logger.error("SessionManager: Failed to refresh TTL", { error });
+    }
+  }
+
+  private static markVersionedCapabilityUnavailable(error: unknown): void {
+    this.versionedCapability = "unavailable";
+    logger.warn("SessionManager: Versioned binding disabled", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  private static async ensureVersionedBindingCapability(redis: Redis): Promise<boolean> {
+    const connectionGeneration = getRedisConnectionGeneration();
+    if (
+      this.versionedCapabilityClient !== redis ||
+      this.versionedCapabilityConnectionGeneration !== connectionGeneration
+    ) {
+      this.versionedCapability = "unknown";
+      this.versionedCapabilityClient = redis;
+      this.versionedCapabilityConnectionGeneration = connectionGeneration;
+      this.versionedCapabilityPromise = null;
+    }
+
+    if (this.versionedCapability === "available") return true;
+    if (this.versionedCapability === "unavailable") return false;
+    if (this.versionedCapabilityPromise) return this.versionedCapabilityPromise;
+
+    const token = crypto.randomBytes(12).toString("hex");
+    const prefix = `session-binding-capability:${token}`;
+    const keys = [
+      `${prefix}:binding`,
+      `${prefix}:provider`,
+      `${prefix}:key`,
+      `${prefix}:lease`,
+      `${prefix}:cooldown`,
+    ];
+
+    this.versionedCapabilityPromise = (async () => {
+      try {
+        await redis.eval(
+          PROBE_VERSIONED_SESSION_BINDING,
+          keys.length,
+          ...keys,
+          "probe-key",
+          randomGeneration()
+        );
+        this.versionedCapability = "available";
+        return true;
+      } catch (error) {
+        this.markVersionedCapabilityUnavailable(error);
+        return false;
+      } finally {
+        this.versionedCapabilityPromise = null;
+      }
+    })();
+
+    return this.versionedCapabilityPromise;
+  }
+
+  static getVersionedBindingCapability(): VersionedCapability {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return "unavailable";
+    if (
+      this.versionedCapabilityClient !== redis ||
+      this.versionedCapabilityConnectionGeneration !== getRedisConnectionGeneration()
+    ) {
+      return "unknown";
+    }
+    return this.versionedCapability;
+  }
+
+  static async readSessionBindingSnapshot(
+    sessionId: string,
+    keyId: number
+  ): Promise<SessionBindingSnapshot> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") {
+      return { status: "unavailable", binding: null, discoveryEligible: false, reason: "redis_unavailable" };
+    }
+    if (!(await this.ensureVersionedBindingCapability(redis))) {
+      return {
+        status: "unavailable",
+        binding: null,
+        discoveryEligible: false,
+        reason: "versioned_binding_unavailable",
+      };
+    }
+
+    const keys = buildVersionedBindingKeys(sessionId, keyId);
+    try {
+      const raw = await redis.eval(
+        READ_OR_RECONCILE_SESSION_BINDING,
+        3,
+        keys.binding,
+        keys.legacyProvider,
+        keys.legacyKey,
+        String(keyId),
+        String(this.SESSION_TTL),
+        randomGeneration()
+      );
+      const result = parseLuaJson(raw);
+      if (!result || result.status === "unavailable") {
+        this.markVersionedCapabilityUnavailable(new Error("invalid READ_OR_RECONCILE response"));
+        return {
+          status: "unavailable",
+          binding: null,
+          discoveryEligible: false,
+          reason: "malformed_reconcile_response",
+        };
+      }
+
+      const providerId =
+        typeof result.providerId === "number" && Number.isInteger(result.providerId)
+          ? result.providerId
+          : null;
+      const generation = typeof result.generation === "string" ? result.generation : "";
+      const snapshotKeyId = typeof result.keyId === "string" ? Number(result.keyId) : NaN;
+      const discoveryEligible = result.discoveryEligible === true;
+      if (!generation || snapshotKeyId !== keyId) {
+        return {
+          status: "ok",
+          binding: null,
+          discoveryEligible: false,
+          reason: "invalid_binding_snapshot",
+        };
+      }
+
+      return {
+        status: "ok",
+        binding: { providerId, keyId: snapshotKeyId, generation },
+        discoveryEligible,
+        reason: typeof result.reason === "string" ? result.reason : "unknown",
+      };
+    } catch (error) {
+      this.markVersionedCapabilityUnavailable(error);
+      return {
+        status: "unavailable",
+        binding: null,
+        discoveryEligible: false,
+        reason: "versioned_binding_error",
+      };
+    }
+  }
+
+  static async casSessionBinding(
+    sessionId: string,
+    snapshot: { providerId: number | null; keyId: number; generation: string },
+    newProviderId: number
+  ): Promise<{ ok: boolean; reason: string; generation?: string }> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return { ok: false, reason: "redis_unavailable" };
+    if (!(await this.ensureVersionedBindingCapability(redis))) {
+      return { ok: false, reason: "versioned_binding_unavailable" };
+    }
+
+    const keys = buildVersionedBindingKeys(sessionId, snapshot.keyId);
+    const newGeneration = randomGeneration();
+    try {
+      const raw = await redis.eval(
+        CAS_SESSION_BINDING,
+        3,
+        keys.binding,
+        keys.legacyProvider,
+        keys.legacyKey,
+        snapshot.providerId == null ? "" : String(snapshot.providerId),
+        snapshot.generation,
+        String(snapshot.keyId),
+        String(newProviderId),
+        newGeneration,
+        String(this.SESSION_TTL)
+      );
+      const result = parseLuaJson(raw);
+      if (!result) {
+        this.markVersionedCapabilityUnavailable(new Error("invalid CAS response"));
+        return { ok: false, reason: "malformed_cas_response" };
+      }
+      return {
+        ok: result.ok === true,
+        reason: typeof result.reason === "string" ? result.reason : "unknown",
+        generation: typeof result.generation === "string" ? result.generation : undefined,
+      };
+    } catch (error) {
+      this.markVersionedCapabilityUnavailable(error);
+      return { ok: false, reason: "versioned_binding_error" };
+    }
+  }
+
+  static async clearSessionBindingWithCooldown(
+    sessionId: string,
+    snapshot: { providerId: number; keyId: number; generation: string },
+    cooldownTtlSeconds: number
+  ): Promise<{ ok: boolean; reason: string; tombstone?: SessionBindingSnapshot["binding"] }> {
+    const redis = getRedisClient();
+    if (!redis || redis.status !== "ready") return { ok: false, reason: "redis_unavailable" };
+    if (!(await this.ensureVersionedBindingCapability(redis))) {
+      return { ok: false, reason: "versioned_binding_unavailable" };
+    }
+
+    const keys = buildVersionedBindingKeys(sessionId, snapshot.keyId);
+    const newGeneration = randomGeneration();
+    try {
+      const raw = await redis.eval(
+        CLEAR_SESSION_BINDING_AND_COOLDOWN,
+        4,
+        keys.binding,
+        keys.legacyProvider,
+        keys.legacyKey,
+        `${keys.cooldown}:${snapshot.providerId}`,
+        String(snapshot.providerId),
+        snapshot.generation,
+        String(snapshot.keyId),
+        newGeneration,
+        String(this.SESSION_TTL),
+        String(Math.max(1, Math.ceil(cooldownTtlSeconds)))
+      );
+      const result = parseLuaJson(raw);
+      if (!result) {
+        this.markVersionedCapabilityUnavailable(new Error("invalid clear response"));
+        return { ok: false, reason: "malformed_clear_response" };
+      }
+      return {
+        ok: result.ok === true,
+        reason: typeof result.reason === "string" ? result.reason : "unknown",
+        tombstone:
+          result.ok === true
+            ? { providerId: null, keyId: snapshot.keyId, generation: newGeneration }
+            : undefined,
+      };
+    } catch (error) {
+      this.markVersionedCapabilityUnavailable(error);
+      return { ok: false, reason: "versioned_binding_error" };
     }
   }
 

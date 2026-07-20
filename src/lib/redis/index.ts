@@ -1,6 +1,6 @@
 import "server-only";
 
-export { closeRedis, getRedisClient } from "./client";
+export { closeRedis, getRedisClient, getRedisConnectionGeneration } from "./client";
 export {
   getLeaderboardWithCache,
   invalidateAllLeaderboardCaches,

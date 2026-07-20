@@ -3,6 +3,8 @@ import { getEnvConfig } from "@/lib/config/env.schema";
 import { logger } from "@/lib/logger";
 
 let redisClient: Redis | null = null;
+let redisClientUrl: string | null = null;
+let redisConnectionGeneration = 0;
 
 function maskRedisUrl(redisUrl: string) {
   try {
@@ -105,9 +107,18 @@ export function getRedisClient(input?: { allowWhenRateLimitDisabled?: boolean })
 
   const safeRedisUrl = maskRedisUrl(redisUrl);
 
+  if (redisClient && redisClientUrl !== redisUrl) {
+    redisClient.disconnect();
+    redisClient = null;
+    redisClientUrl = null;
+    redisConnectionGeneration++;
+  }
+
   if (redisClient) {
     if (redisClient.status === "end") {
       redisClient = null;
+      redisClientUrl = null;
+      redisConnectionGeneration++;
     } else {
       return redisClient;
     }
@@ -123,10 +134,12 @@ export function getRedisClient(input?: { allowWhenRateLimitDisabled?: boolean })
     // 3. 使用组合后的配置创建客户端
     const client = new Redis(redisUrl, redisOptions);
     redisClient = client;
+    redisClientUrl = redisUrl;
 
     // 4. 保持原始的事件监听器
     client.on("connect", () => {
       if (redisClient !== client) return;
+      redisConnectionGeneration++;
       logger.info("[Redis] Connected successfully", {
         protocol: useTls ? "rediss" : "redis",
         tlsEnabled: useTls,
@@ -153,6 +166,8 @@ export function getRedisClient(input?: { allowWhenRateLimitDisabled?: boolean })
       if (redisClient !== client) return;
       logger.warn("[Redis] Connection ended, resetting client", { redisUrl: safeRedisUrl });
       redisClient = null;
+      redisClientUrl = null;
+      redisConnectionGeneration++;
     });
 
     // 5. 返回客户端实例
@@ -161,6 +176,10 @@ export function getRedisClient(input?: { allowWhenRateLimitDisabled?: boolean })
     logger.error("[Redis] Failed to initialize:", error, { redisUrl: safeRedisUrl });
     return null;
   }
+}
+
+export function getRedisConnectionGeneration(): number {
+  return redisConnectionGeneration;
 }
 
 export async function closeRedis(): Promise<void> {
@@ -179,6 +198,8 @@ export async function closeRedis(): Promise<void> {
   } finally {
     if (redisClient === client) {
       redisClient = null;
+      redisClientUrl = null;
+      redisConnectionGeneration++;
     }
   }
 }

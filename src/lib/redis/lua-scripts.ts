@@ -376,3 +376,174 @@ end
 
 return tostring(total)
 `;
+
+/**
+ * Read or reconcile a session binding during the legacy-to-versioned rollout.
+ *
+ * KEYS[1]: versioned binding hash
+ * KEYS[2]: legacy provider string
+ * KEYS[3]: legacy keyId string
+ * ARGV[1]: current keyId
+ * ARGV[2]: TTL seconds
+ * ARGV[3]: generation token for initialization/reconciliation
+ */
+export const READ_OR_RECONCILE_SESSION_BINDING = `
+local binding_key = KEYS[1]
+local legacy_provider_key = KEYS[2]
+local legacy_key_key = KEYS[3]
+local current_key_id = ARGV[1]
+local ttl = tonumber(ARGV[2])
+local generation = ARGV[3]
+
+local binding_exists = redis.call('EXISTS', binding_key) == 1
+local legacy_provider = redis.call('GET', legacy_provider_key)
+local legacy_key_id = redis.call('GET', legacy_key_key)
+
+local function response(status, reason, provider_id, key_id, binding_generation, eligible)
+  local provider = cjson.null
+  if provider_id ~= nil and provider_id ~= '' then
+    provider = tonumber(provider_id)
+  end
+  return cjson.encode({
+    status = status,
+    reason = reason,
+    providerId = provider,
+    keyId = key_id,
+    generation = binding_generation,
+    discoveryEligible = eligible,
+  })
+end
+
+if not binding_exists and not legacy_provider and not legacy_key_id then
+  redis.call('HSET', binding_key, 'providerId', '', 'keyId', current_key_id, 'generation', generation)
+  redis.call('EXPIRE', binding_key, ttl)
+  redis.call('SET', legacy_key_key, current_key_id, 'EX', ttl)
+  return response('ok', 'initialized_empty', nil, current_key_id, generation, true)
+end
+
+if not binding_exists and legacy_provider and not legacy_key_id then
+  return response('ok', 'legacy_owner_unknown', nil, current_key_id, '', false)
+end
+
+if legacy_key_id and legacy_key_id ~= current_key_id then
+  return response('ok', 'foreign_legacy_state', nil, current_key_id, '', false)
+end
+
+if not binding_exists then
+  local provider_id = legacy_provider or ''
+  redis.call('HSET', binding_key, 'providerId', provider_id, 'keyId', current_key_id, 'generation', generation)
+  redis.call('EXPIRE', binding_key, ttl)
+  redis.call('EXPIRE', legacy_key_key, ttl)
+  if legacy_provider then
+    redis.call('EXPIRE', legacy_provider_key, ttl)
+  end
+  return response('ok', 'lazy_upgraded', provider_id, current_key_id, generation, true)
+end
+
+local provider_id = redis.call('HGET', binding_key, 'providerId')
+local binding_key_id = redis.call('HGET', binding_key, 'keyId')
+local binding_generation = redis.call('HGET', binding_key, 'generation')
+if not provider_id or not binding_key_id or not binding_generation then
+  return response('unavailable', 'malformed_binding', nil, current_key_id, '', false)
+end
+
+if not legacy_key_id or legacy_key_id ~= current_key_id then
+  return response('ok', 'legacy_mirror_missing_or_mismatched', nil, current_key_id, binding_generation, false)
+end
+if not legacy_provider and provider_id ~= '' then
+  return response('ok', 'legacy_provider_missing', nil, current_key_id, binding_generation, false)
+end
+if legacy_provider and provider_id ~= legacy_provider then
+  return response('ok', 'legacy_provider_mismatch', nil, current_key_id, binding_generation, false)
+end
+
+redis.call('EXPIRE', binding_key, ttl)
+redis.call('EXPIRE', legacy_key_key, ttl)
+if legacy_provider then
+  redis.call('EXPIRE', legacy_provider_key, ttl)
+end
+return response('ok', 'consistent', provider_id, binding_key_id, binding_generation, true)
+`;
+
+/**
+ * Conditionally create or renew a versioned session binding and dual-write the
+ * legacy mirror. Missing binding keys are CAS failures by design.
+ */
+export const CAS_SESSION_BINDING = `
+local binding_key = KEYS[1]
+local legacy_provider_key = KEYS[2]
+local legacy_key_key = KEYS[3]
+local expected_provider = ARGV[1]
+local expected_generation = ARGV[2]
+local current_key_id = ARGV[3]
+local new_provider = ARGV[4]
+local new_generation = ARGV[5]
+local ttl = tonumber(ARGV[6])
+
+if redis.call('EXISTS', binding_key) ~= 1 then
+  return cjson.encode({ok = false, reason = 'missing_binding'})
+end
+local provider_id = redis.call('HGET', binding_key, 'providerId')
+local key_id = redis.call('HGET', binding_key, 'keyId')
+local generation = redis.call('HGET', binding_key, 'generation')
+if not provider_id or not key_id or not generation then
+  return cjson.encode({ok = false, reason = 'malformed_binding'})
+end
+if provider_id ~= expected_provider or key_id ~= current_key_id or generation ~= expected_generation then
+  return cjson.encode({ok = false, reason = 'cas_conflict'})
+end
+
+redis.call('HSET', binding_key, 'providerId', new_provider, 'keyId', current_key_id, 'generation', new_generation)
+redis.call('EXPIRE', binding_key, ttl)
+redis.call('SET', legacy_provider_key, new_provider, 'EX', ttl)
+redis.call('SET', legacy_key_key, current_key_id, 'EX', ttl)
+return cjson.encode({ok = true, reason = 'cas_success', providerId = tonumber(new_provider), keyId = current_key_id, generation = new_generation})
+`;
+
+/**
+ * Atomically clear Sticky binding, create a null tombstone, and write cooldown.
+ */
+export const CLEAR_SESSION_BINDING_AND_COOLDOWN = `
+local binding_key = KEYS[1]
+local legacy_provider_key = KEYS[2]
+local legacy_key_key = KEYS[3]
+local cooldown_key = KEYS[4]
+local expected_provider = ARGV[1]
+local expected_generation = ARGV[2]
+local current_key_id = ARGV[3]
+local new_generation = ARGV[4]
+local binding_ttl = tonumber(ARGV[5])
+local cooldown_ttl = tonumber(ARGV[6])
+
+if redis.call('EXISTS', binding_key) ~= 1 then
+  return cjson.encode({ok = false, reason = 'missing_binding'})
+end
+local provider_id = redis.call('HGET', binding_key, 'providerId')
+local key_id = redis.call('HGET', binding_key, 'keyId')
+local generation = redis.call('HGET', binding_key, 'generation')
+if provider_id ~= expected_provider or key_id ~= current_key_id or generation ~= expected_generation then
+  return cjson.encode({ok = false, reason = 'cas_conflict'})
+end
+
+redis.call('HSET', binding_key, 'providerId', '', 'keyId', current_key_id, 'generation', new_generation)
+redis.call('EXPIRE', binding_key, binding_ttl)
+redis.call('DEL', legacy_provider_key)
+redis.call('SET', legacy_key_key, current_key_id, 'EX', binding_ttl)
+redis.call('SET', cooldown_key, '1', 'EX', cooldown_ttl)
+return cjson.encode({ok = true, reason = 'cleared', providerId = cjson.null, keyId = current_key_id, generation = new_generation})
+`;
+
+/**
+ * Capability probe for the actual multi-key/type shape used by versioned
+ * binding, legacy mirrors, lease, and cooldown keys.
+ */
+export const PROBE_VERSIONED_SESSION_BINDING = `
+redis.call('HSET', KEYS[1], 'providerId', '', 'keyId', ARGV[1], 'generation', ARGV[2])
+redis.call('SET', KEYS[2], 'probe-provider', 'EX', 30)
+redis.call('SET', KEYS[3], ARGV[1], 'EX', 30)
+redis.call('SET', KEYS[4], 'probe-owner', 'EX', 30)
+redis.call('SET', KEYS[5], '1', 'EX', 30)
+redis.call('EXPIRE', KEYS[1], 30)
+redis.call('DEL', KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5])
+return 1
+`;
