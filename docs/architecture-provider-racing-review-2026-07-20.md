@@ -15,7 +15,7 @@
 |------|----------|----------|
 | 触发 | 初始 Provider 的 `firstByteTimeoutStreamingMs` 到期后 `launchAlternative` 再起一家 | 每轮固定选 N 家并发 |
 | 赢家 | **任意非空首字节** `readFirstReadableChunk` 即 `commitWinner`，立刻 `abortAllAttempts` | **有效首字**（协议语义）才赢；旧轮继续跑并入兜底池 |
-| 输家 | 可 cancel，或 `billHedgeLosers` 后台 drain 计费；**不参与再比较** | 旧结果暂存，最后一轮按首字耗时与完整可交付性兜底 |
+| 输家 | 可 cancel，或在系统开关 `billHedgeLosers` 开启时由 `startLoserBilling` → `finalizeHedgeLoserBilling` 后台 drain 计费；**不参与再比较** | 旧结果暂存，最后一轮按首字耗时与完整可交付性兜底 |
 | Sticky | 赢家 `SessionManager.updateSessionBindingSmart` 改绑；超时语义绑在 Provider 的 first-byte timeout 上 | Sticky 独立 SLA；超时后 Sticky Discovery（SLA=Sticky SLA），原 Sticky 只进最终兜底 |
 | Fake 200 | **流结束后** `detectUpstreamErrorFromSseOrJsonText` / `response-validator`；已透传则无法改 HTTP 状态 | 假成功**不得**进入赢家/兜底结果池 |
 | 终态失败 | `resolveHedgeTerminalError` → 客户端不可重试错误原样抛；其余 **503 +「所有供应商暂时不可用…」** | 见下文业务问题 B |
@@ -61,8 +61,8 @@
    → 兜底池元素的准入条件应是：**有效首字时刻 T_first + 完整结束 + 校验 ok**，比较键主要是 **T_first**（最后一轮与旧最佳比的是首字耗时，不是总耗时）。
 
 3. **实现复杂度与资源**  
-   方案 2 需要每 attempt：tee/缓冲上限、内存 cap、中途 abort 一致性、与 `billHedgeLosers` drain 共用 reader 的互斥、客户端 abort 时多路清理。现有 `buildBufferedFirstChunkStream` 只解决「赢家已选定后的首块补回」，**不能**直接扩展成多候选长时间缓存回放。  
-   方案 1 可复用「完整 body 已在内存/有界 buffer」模式（response-handler 已有 head/tail 文本累积思路），或对兜底候选在后台 drain 到有界 buffer，仅 `ok` 的进入 pool。
+   方案 2 需要每 attempt：tee/缓冲上限、内存 cap、中途 abort 一致性、与输家计费 drain（`startLoserBilling` / `finalizeHedgeLoserBilling`）对 **同一 `attempt.reader` 的互斥**、客户端 abort 时多路清理。现有 `buildBufferedFirstChunkStream` 只解决「赢家已选定后的首块补回」，**不能**直接扩展成多候选长时间缓存回放。  
+   方案 1 可复用「完整 body 已在内存/有界 buffer」模式（response-handler 已有 head/tail 文本累积思路），或对兜底候选在后台 drain 到有界 buffer，仅 `ok` 的进入 pool。注意：`billHedgeLosers` 只是系统配置布尔开关（DB 列），真正执行 drain/计费的是上述两个函数。
 
 4. **与已确认规则的一致性**  
    - 「A 有完整结果、首字 20s；E/F 首字都 >20s → 可用 A」—— 明确要求 **完整可交付**。  
@@ -94,9 +94,18 @@
 3. 计费：R 按赢家路径；其他 attempt 走输家策略，**不得**双计赢家。  
 4. **内存 cap（快照缓冲）**  
    - 每 attempt 缓冲上限可配置。  
-   - **超 cap → 该 attempt 立即失去兜底资格，记链路 reason（如 `fallback_buffer_cap_exceeded`），并直接 cancel 上游连接**（可与 `billHedgeLosers` 策略协调：若需计费可在 cap 前已读部分上尽力抽取 usage，但**不再**为回放保留连接）。  
-   - **不存在**「超 cap 后仍可作为普通轮活流当场赢」的路径：进入快照缓冲的前提是**有效首字已产生且该 attempt 已错过/退出当场夺冠窗口**（已被更快赢家提交，或本轮 SLA 已过进入后台 drain）。此时再谈「Discovery 窗内活流赢」在时序上不可达。  
-   - 实现者不得保留悬空「半缓冲半活流」状态。
+   - **超 cap → 该 attempt 立即失去兜底资格，记链路 reason（如 `fallback_buffer_cap_exceeded`），并直接 cancel 上游连接**（若系统开关 `billHedgeLosers` 开启，可在 cap 前已读字节上尽力走 `finalizeHedgeLoserBilling` 抽 usage，但**不再**为回放保留连接）。  
+   - **不存在**「超 cap 后仍可作为普通轮活流当场赢」的路径：进入快照缓冲的前提是**有效首字已产生且该 attempt 已错过/退出当场夺冠窗口**（已被更快赢家提交，或本轮 SLA 已过进入后台）。此时再谈「Discovery 窗内活流赢」在时序上不可达。  
+   - 实现者不得保留悬空「半缓冲半活流」状态。  
+
+5. **硬不变量：单 attempt 的 body/`reader` 独占消费（调度器必须强制）**  
+   - 现网 `forwarder.ts` 中输家路径注释写明：实际后台 drain 由 `runAttempt` 流程发起，**「它独占 reader，避免并发读」**；入口为 `startLoserBilling`，落账为 `finalizeHedgeLoserBilling`。  
+   - 一个 attempt 的响应 body **只能被消费一次**。因此 **路径 S 快照缓冲 drain** 与 **输家计费 drain（`startLoserBilling`）** 对同一 attempt **互斥**，不得两路并发 `read`。  
+   - **决策时刻**：该 attempt **退出夺冠窗口**（普通轮已有路径 L 赢家 / 轮 SLA 到期转后台 / 末轮比较器判定其不能再走路径 L）的瞬间，调度器必须二选一打标，例如：  
+     - `consumeMode: "snapshot_pool"` — 仅为路径 S 缓冲；校验 ok 入池；失败或超 cap 则 cancel（可选：缓冲过程中顺带抽 usage，但仍是**同一条** drain，不是第二条 reader）；  
+     - `consumeMode: "loser_billing"` — 仅 `startLoserBilling` → `finalizeHedgeLoserBilling`，**不**进快照池；  
+     - `consumeMode: "cancel"` — 直接取消，不计费不入池。  
+   - **禁止**：先 `startLoserBilling` 再对同一 reader 做快照回放；或 tee 成两条逻辑读而不在文档/实现中显式承担双倍内存与一致性成本（首期不做 tee）。
 
 ### 2.5 明确不推荐作为默认
 
@@ -106,7 +115,7 @@
 
 ### 2.6 业务问题 A 一句话决策
 
-> **旧轮/pool-only 暂存 = 后台 drain 至完整 + 校验通过后的只读快照；快照兜底（路径 S）只从池中按 T_first 选优并整包回放。当轮/Sticky 夺冠（路径 L）始终活连接续传。无完整可交付快照则不能用该旧 Provider 结束请求。超 cap：丢兜底资格并 cancel，不留活流悬空。**
+> **旧轮/pool-only 暂存 = 后台独占 drain 至完整 + 校验通过后的只读快照；快照兜底（路径 S）只从池中按 T_first 选优并整包回放。当轮/Sticky 夺冠（路径 L）始终活连接续传。无完整可交付快照则不能用该旧 Provider 结束请求。超 cap：丢兜底资格并 cancel，不留活流悬空。同一 attempt 的路径 S 缓冲与 `startLoserBilling` 互斥，退出夺冠窗时选定唯一 `consumeMode`。**
 
 ---
 
@@ -278,11 +287,12 @@
 ### 5.1 可复用
 
 - Shadow session / attempt 隔离、agent 引用计数、client abort 扇出。  
-- 输家计费与 `hedge_losers` 账务。  
+- 输家计费链路：`billHedgeLosers`（配置开关）→ attempt 上 `billAsLoser` → `startLoserBilling`（forwarder，独占 `attempt.reader` drain）→ `finalizeHedgeLoserBilling`（response-handler，`hedge_losers` 账务）。  
 - 决策链 reason：可增 `discovery_round` / `final_round` / `live_winner` / `fallback_winner` / `sticky_discovery` / `fallback_buffer_cap_exceeded`。  
 - Fake 200 检测库与 circuit / 清 Sticky 绑定侧效应。  
 - Provider 排除选择：`pickRandomProviderWithExclusion`。  
-- 终态 503 文案与 client-safe 映射；**路径 L** 可继续用 `buildBufferedFirstChunkStream`。
+- 终态 503 文案与 client-safe 映射；**路径 L** 可继续用 `buildBufferedFirstChunkStream`。  
+- **路径 S 与输家计费**：复用「单 reader 独占 drain」模式，但在退出夺冠窗时与 `startLoserBilling` **互斥择一**（见 §2.4-5），不能并行挂两套 drain。
 
 ### 5.2 需新增/大改（工作量粗估）
 
@@ -301,6 +311,7 @@
 - **业务方案在补齐 §2 双路径 / §3 / §4.0 后可闭环。**  
 - **工程上可在现有 hedge 演进**，属调度语义升级，非调参。  
 - **首期砍掉半截回放**；路径 L 沿用活流，路径 S 才整包回放。  
+- **单 attempt reader 独占**：路径 S 缓冲与 `startLoserBilling` 互斥，调度器在退出夺冠窗时强制 `consumeMode`。  
 - **不建议**在未定义有效首字规则前上线多轮兜底。
 
 ---
