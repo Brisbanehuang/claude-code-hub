@@ -2,7 +2,8 @@
 
 **日期**: 2026-07-20  
 **范围**: 剩余两个业务问题 + 整体业务闭环 + 基于现有 Claude Code Hub（CCH）实现的可行性  
-**结论性质**: 架构/产品决策建议，**不编码**
+**结论性质**: 架构/产品决策建议，**不编码**  
+**修订**: 按架构审阅反馈修正：双交付路径拆分、超 cap 处理、最后一轮定义、504 breaking 标注、末轮 in-flight 等待边界
 
 ---
 
@@ -32,7 +33,7 @@
 
 ### 2.1 问题陈述
 
-旧轮请求不参加后续普通竞赛，但继续产生结果并参与最终兜底。若最终选用旧轮结果，客户端尚未收到任何字节时，应如何交付？
+旧轮请求不参加后续普通竞赛，但继续产生结果并参与最终兜底。若最终选用**旧轮**结果，客户端尚未收到任何字节时，应如何交付？
 
 可选语义：
 
@@ -42,7 +43,9 @@
 
 ### 2.2 推荐结论（默认采用 1 + 3 的组合，不以 2 作为默认）
 
-**推荐：兜底交付必须「完整可重放 + 已通过可交付校验」；不允许「半截前缀回放」作为默认业务语义。**
+**推荐：旧轮/兜底交付必须「完整可重放 + 已通过可交付校验」；不允许「半截前缀回放」作为默认业务语义。**
+
+这只约束 **快照池兜底路径**，**不**约束当轮活流赢家路径（见 §2.3 双路径拆分）。
 
 理由（与 CCH 现状对齐）：
 
@@ -66,23 +69,44 @@
    - 「E/F 首字都慢，但没有完整可交付 → 继续等」—— 否定「仅有首字即可交付」。  
    - 因此 **strict 完整可重放** 是对上述两条的直接 entailing，而不是额外产品偏好。
 
-### 2.3 交付形态（实现指引级，非本次编码）
+### 2.3 双交付路径（必须拆开，禁止混用）
+
+成功结束请求时，赢家只可能来自下列两条路径之一。实现与文档均不得把「末轮活流赢家」误写成「快照整包回放」。
+
+| 维度 | 路径 L：**活流赢家**（Live winner） | 路径 S：**快照兜底赢家**（Snapshot fallback winner） |
+|------|--------------------------------------|-----------------------------------------------------|
+| **何时出现** | **普通轮**（含 Sticky 单飞）在轮 SLA 内产生有效首字并当场夺冠；**或最后一轮**当轮候选有效首字耗时 `T_first ≤` 池中最佳完整结果的 `T_first`（池空时：首个有效首字的当轮候选亦可夺冠，见 §4.1） | 决胜结束时，**没有任何活流赢家**，且快照池非空：按池内 `T_first` 最优（并列规则可再定）选出旧 attempt |
+| **谁** | **当前仍持有上游 reader 的当轮（或 Sticky）attempt** | **已完整结束并校验 ok 的旧轮 / pool-only attempt**（含 Sticky 超时后仅入池的原 Sticky） |
+| **对客户端 body** | **活连接续传**：已读首块用 `buildBufferedFirstChunkStream` 类方式补回，其后继续 `reader.read()` 透传；**禁止**先 drain 完整再回放 | **整包回放**：新建 `Response`，body 为已缓冲完整字节的固定 ReadableStream（可分 chunk 推送，内容不再读上游） |
+| **延迟特征** | 客户端在有效首字确认后立即开始收流 | 客户端在快照入池完成后才开始收流（内容已齐，无上游尾延迟） |
+| **Sticky** | 赢家 Provider 绑定 / 续绑 Sticky（`updateSessionBindingSmart`） | 同样允许成为 Sticky（已确认规则） |
+| **计费** | 该 attempt 走**赢家**计费 + 流式 finalization；其余 attempt 输家 cancel 或 `hedge_loser_billed` | 被选中的快照 attempt 走**赢家**计费；不得因「曾进池」对其他快照再计赢家；未选中快照可按输家/已计费策略处理 |
+| **Fake 200** | 有效首字门闸 + 流中/流后检测；一旦判定 fake 则该 attempt **不能**保持赢家身份（若已开始透传则按现网「已转发假成功」约束处理侧效应，清 Sticky 等） | **入池前强制完整可交付校验**；fake 200 **不得入池** |
+
+**关键禁令**：最后一轮当轮 Provider 因 `T_first` 胜出时，走路径 L，**不得**为「统一实现」改成路径 S（否则多等一整段生成时间 + 无谓内存）。
+
+### 2.4 快照路径交付形态（仅路径 S）
 
 当最终赢家是「兜底池中的 attempt R」时：
 
-1. 对客户端：新建 `Response`，`status/headers` 取 R 的上游成功响应快照；body 为 **已缓冲的完整字节序列** 的一次性 ReadableStream（可分 chunk 回放，但内容固定）。  
-2. Sticky：按已确认规则，兜底赢家可 `updateSessionBindingSmart` 绑定到 R。  
-3. 计费：R 按赢家路径；其他 attempt 走现有输家 cancel / `hedge_loser_billed` 策略（可配置），**不得**因「曾进过兜底池」双计赢家。  
-4. **内存 cap**：每 attempt 缓冲上限（建议与现有 SSE 检测/日志截断同量级可配置）；超 cap 的 attempt **失去兜底资格**，仅可继续作为「若在普通轮内先出有效首字则当场赢」的活流（若仍在 Discovery 窗内）。超 cap 记链路上的明确 reason，避免静默丢兜底。
+1. 对客户端：新建 `Response`，`status/headers` 取 R 的上游成功响应快照；body 为 **已缓冲的完整字节序列** 的一次性 ReadableStream。  
+2. Sticky：按已确认规则绑定到 R。  
+3. 计费：R 按赢家路径；其他 attempt 走输家策略，**不得**双计赢家。  
+4. **内存 cap（快照缓冲）**  
+   - 每 attempt 缓冲上限可配置。  
+   - **超 cap → 该 attempt 立即失去兜底资格，记链路 reason（如 `fallback_buffer_cap_exceeded`），并直接 cancel 上游连接**（可与 `billHedgeLosers` 策略协调：若需计费可在 cap 前已读部分上尽力抽取 usage，但**不再**为回放保留连接）。  
+   - **不存在**「超 cap 后仍可作为普通轮活流当场赢」的路径：进入快照缓冲的前提是**有效首字已产生且该 attempt 已错过/退出当场夺冠窗口**（已被更快赢家提交，或本轮 SLA 已过进入后台 drain）。此时再谈「Discovery 窗内活流赢」在时序上不可达。  
+   - 实现者不得保留悬空「半缓冲半活流」状态。
 
-### 2.4 明确不推荐作为默认
+### 2.5 明确不推荐作为默认
 
-- **从首字开始的实时回放半截流**：仅可作为后续优化（例如「已验证 message_stop 前的完整可交付前缀」且协议允许），首期不做。  
-- **把未校验的 firstChunk 当可交付**：与 fake 200 边界冲突。
+- **从首字开始的实时回放半截流（路径 2）**：仅可作为后续优化，首期不做。  
+- **把未校验的 firstChunk 当可交付**：与 fake 200 边界冲突。  
+- **把路径 L 做成整包回放**：延迟与内存双惩罚。
 
-### 2.5 业务问题 A 一句话决策
+### 2.6 业务问题 A 一句话决策
 
-> **暂存结果 = 后台 drain 至完整 + 协议/可交付校验通过后的只读快照；最终兜底只从快照池按首字耗时选优并整包回放。无完整可交付快照则不能用该 Provider 结束请求。**
+> **旧轮/pool-only 暂存 = 后台 drain 至完整 + 校验通过后的只读快照；快照兜底（路径 S）只从池中按 T_first 选优并整包回放。当轮/Sticky 夺冠（路径 L）始终活连接续传。无完整可交付快照则不能用该旧 Provider 结束请求。超 cap：丢兜底资格并 cancel，不留活流悬空。**
 
 ---
 
@@ -90,53 +114,89 @@
 
 ### 3.1 触发条件（应统一走同一终态）
 
-在整体请求硬超时（若配置）或「候选耗尽且 in-flight 全部 settled」时，若：
+在整体请求硬超时（若启用）或「候选耗尽且 in-flight 全部 settled」时，若：
 
 - 没有任何 attempt 产生 **有效首字且完整可交付** 的快照，且  
-- 当前也没有仍可等待的 in-flight 候选，  
+- 当前也没有仍可等待的 in-flight 候选，且  
+- 没有任何路径 L 赢家已提交，  
 
 则进入 **Terminal Failure**。
 
-（有完整可交付快照时，即使最后一轮「竞赛」输了，也应走兜底成功，而不是失败。）
+（快照池非空时，即使最后一轮「竞赛」未产生活流赢家，也应走路径 S 成功，而不是失败。）
 
-### 3.2 推荐结论：分层错误，而不是单一 503
+### 3.2 推荐结论：分层错误；默认保持 503 对外契约
 
-与现有 `resolveHedgeTerminalError` 对齐并扩展：
+与现有 `resolveHedgeTerminalError` 对齐：
 
 | 优先级 | 条件 | 对客户端 | 对内链/熔断/Sticky |
 |--------|------|----------|-------------------|
-| P0 | 客户端 abort | **499**（或现有 CLIENT_ABORT 映射），保留 abort 语义 | 不记 Provider 熔断；不写 Sticky |
-| P1 | 存在 **NON_RETRYABLE_CLIENT_ERROR**（明确 4xx 业务/鉴权类，且判定为请求本身不可换 Provider 重试） | **原样透传该错误**（status + 安全文案） | 按现有 client_error 链；通常不熔断 Provider |
-| P2 | 全部为 Provider/基础设施失败、空响应、fake 200、超时、无候选 | **503** + 现有文案 `所有供应商暂时不可用，请稍后重试`（`ALL_PROVIDERS_UNAVAILABLE_MESSAGE`） | 各 attempt 已按规则记 `retry_failed` / fake-200 / timeout；**清除或不要建立** 成功 Sticky；可保留「失败 Provider 排除」供同 session 后续请求 |
-| P3 | 硬超时打断仍有 in-flight | **504 或 503**（建议 **504** 表示网关/代理侧整体等待超时，与单 Provider 524 区分）；body 仍用统一安全文案 | in-flight abort；已完整可交付的若在超时前入池则应优先成功兜底，避免「有快照仍 504」 |
+| P0 | 客户端 abort | **499**（或现有 CLIENT_ABORT 映射） | 不记 Provider 熔断；不写 Sticky |
+| P1 | 存在 **NON_RETRYABLE_CLIENT_ERROR** | **原样透传** | 按现有 client_error 链 |
+| P2 | 全部为 Provider/基础设施失败、空响应、fake 200、轮次/候选超时、无候选 | **503** + `所有供应商暂时不可用，请稍后重试` | 记失败链；**不**建成功 Sticky |
+| P3 | 整体硬超时且池空、无活流赢家 | **默认仍 503**（与现网一致）；可选 504 见下 | in-flight abort；超时前已入池则优先路径 S |
 
-**说明**：
+**关于 504（breaking change 标注）**
 
-- 现有 hedge 终态已是：**abort/不可重试客户端错误 → 原样；否则 503 统一不可用**。目标多轮方案应**保持这一对外契约**，避免客户端出现「有时 502 有时 500 有时 upstream 原文」的碎片化。  
-- Fake 200 在链路上应记 **失败**（effective 4xx/5xx + `FAKE_200_*`），**不得**冒充 200 成功结束；对客户端若已全部失败，归入 P2 的 503，而不是把某个 FAKE_200 的 502 直接当最终 HTTP（除非唯一 attempt 且希望透传——**不推荐**，多 Provider 场景统一 503 更可缓存/重试）。  
-- 「明确报错继续用现有错误处理，不作为慢响应结果」—— 与 P1/分类器一致：显式错误进失败集，不进兜底快照池。
+- 现网 `resolveHedgeTerminalError` **只有**：透传（CLIENT_ABORT / NON_RETRYABLE_CLIENT_ERROR）或统一 **503**。  
+- 若引入 **504** 表示「racing 整体 deadline 到期」，属于**对外 HTTP 契约的 breaking change**：客户端重试策略通常对 503 与 504 处理不同（503 更常被重试，504 语义含糊）。  
+- **架构默认建议：P3 继续用 503 + 同一文案**，与现网一致，避免 silent 契约破裂。  
+- 若产品坚持用 504 区分「供应商都挂了」与「总等待超时」，必须：  
+  1. 产品明确签字；  
+  2. 客户端 / SDK / 文档同步变更重试与告警；  
+  3. 监控按新 status 拆分。  
+- 在上述确认完成前，**实现不得擅自改为 504**。
 
-### 3.3 与「继续等待」的边界
+**其他说明**
 
-已确认：最后一轮候选首字都慢于当前最佳完整结果 → 用最佳完整结果；若**没有**完整结果 → **继续等仍在运行的候选**，直到：
+- Fake 200 链路上记失败，**不得** 200 成功结束；全失败时对外归 P2/P3 的 503。  
+- 「明确报错不作为慢响应结果」：显式错误进失败集，不进快照池。
 
-1. 出现第一个 **完整可交付** 快照，或  
-2. 全部 settled 仍无快照，或  
-3. 命中**整体请求硬超时**。
+### 3.3 与「继续等待」的边界（含末轮 in-flight）
 
-硬超时建议：
+已确认：最后一轮候选首字都慢于当前最佳完整结果 → 路径 S；若**没有**完整结果 → **继续等仍在运行的候选**，直到可交付、全 settled 或总 deadline。
 
-- **独立配置**（不要复用流式静默期，也不要仅复用单 Provider first-byte）。  
-- 默认值需产品拍板；架构建议：≥ Sticky SLA × 轮数上界，或单独 `racingTotalDeadlineMs`。  
-- 超时后：若池非空 → 仍成功兜底；池空 → P3。
+#### 3.3.1 各层超时职责（必须写清）
+
+| 超时 | 作用 | 到期行为 |
+|------|------|----------|
+| **轮 Discovery SLA**（冷启动如 10s；Sticky-Discovery 首轮用 Sticky SLA） | 决定「本轮是否还能当场出路径 L 赢家」以及「是否开下一轮」 | 普通轮：无有效首字 → 本轮关闭夺冠窗，attempt **转后台**（drain 争入池），启动下一轮（若仍非最后一轮）。**不**因轮 SLA 单独终态失败。 |
+| **最后一轮的轮 SLA** | 与普通轮相同：约束「当轮有效首字」的竞赛窗 | 到期后：**不再**接受「新的当轮有效首字」作为路径 L 夺冠（见下例外比较规则已在窗内完成的首字仍有效）；窗内未出首字的当轮候选 → **转后台 drain**，与旧池一起进入「池空则等完整可交付」阶段。 |
+| **整体硬超时** `racingTotalDeadlineMs`（独立配置；**不**复用流式静默期） | 整次 racing 的上限 | 池非空 → 路径 S；池空且无路径 L → 终态 P3（默认 503）。**这是防止无限等待的最终闸门。** |
+| **单 Provider 连接/读超时**（现有 first-byte / 传输层） | 单连接卡死 | 该 attempt 失败 settled，不拖死全局 |
+
+#### 3.3.2 末轮 in-flight 迟迟无有效首字
+
+- **不再单独复用「再一个 Discovery SLA」去无限续命**；轮 SLA 到期后该候选只保留「后台出完整快照」资格。  
+- **等待上限 = 整体硬超时**（若未配置整体硬超时，则架构要求**必须配置**或回退为「所有 in-flight 自然 settled」——但生产环境**强烈要求**配置 `racingTotalDeadlineMs`，避免网络半开连接导致请求挂死）。  
+- 池已非空时：最后一轮比较器在「当轮候选均已证明 `T_first` 更差或已过轮 SLA 仍无有效首字」后即可路径 S，**不必**等慢连接完整结束（未入池的慢连接 cancel 或输家计费即可）。  
+- 池空时：等任一后台 attempt 完整可交付入池（路径 S）或全部失败/触顶硬超时。
+
+硬超时其它建议：
+
+- 默认值需产品拍板；量级参考：≥ Sticky SLA × 预期最大轮数 + 余量，或单独业务 SLO。  
+- 超时后：池非空 → 路径 S；池空 → P3。
 
 ### 3.4 业务问题 B 一句话决策
 
-> **终态对外：abort/不可重试客户端错误透传；其余一律 503 统一不可用（硬超时建议 504）。对内：fake 200/空/协议失败全部算失败且不入池、不绑 Sticky；有完整可交付快照则永不走终态失败。**
+> **终态对外：abort/不可重试客户端错误透传；其余默认一律 503 统一不可用（504 为需产品+客户端确认的 breaking 可选项）。对内：fake 200/空/协议失败不入池、不绑 Sticky；有快照则路径 S 成功。末轮慢连接：轮 SLA 只关夺冠窗；无限等由整体硬超时兜住。**
 
 ---
 
 ## 4. 整体业务闭环评估
+
+### 4.0 「最后一轮」定义（blocking 补齐）
+
+**最后一轮（Final Round）** 是 Discovery 中**不会再开启后续并行轮次**的那一轮。触发条件（满足任一即在本轮启动时标记 `isFinalRound=true`）：
+
+1. **余量不足一整轮**：在排除「已选择过的 Provider」（含本请求已 launch 的 id、以及 Sticky-Discovery 中 pool-only 的原 Sticky）之后，**剩余可选 Provider 数量 `R < N`**（`N` 为每轮固定选择数）。则本轮启动 **全部 `R` 个**剩余候选（`R=0` 则无新候选，直接进入「仅后台 + 池」决胜，见下）。  
+2. **已用尽**：`R = 0` 时不存在新的并行轮；若仍有后台 in-flight 或池非空，进入决胜/等待，不再 `launch` 新 Provider。  
+3. **显式轮次上界**（可选配置 `maxDiscoveryRounds`）：若已完成的非最终轮次数达到上界 − 1，则下一轮强制为最后一轮（即使 `R ≥ N` 也只再开一轮，本轮仍选 `min(N, R)` 家，**本轮结束后剩余未选 Provider 本请求内不再使用**）。未配置上界时仅由 (1)(2) 决定。
+
+**推论**：
+
+- 普通轮（`isFinalRound=false`）：轮 SLA 内有效首字 → **路径 L 立即结束竞赛**；无首字 → 后台化 + 下一轮。  
+- 最后一轮（`isFinalRound=true`）：**禁止**「旧池已有完整结果就跳过等待本轮候选」；必须跑完本轮比较器（§4.1）。  
+- Sticky 单飞**不是** Discovery 轮次，不计入 `maxDiscoveryRounds`；Sticky 超时后的 Sticky-Discovery **第一轮** SLA 用 Sticky SLA，但是否为最后一轮仍按上面 (1)(2)(3) 判断。
 
 ### 4.1 状态机（逻辑闭环）
 
@@ -144,61 +204,72 @@
 [入口]
   ├─ 有 Sticky Provider？
   │    ├─ 是 → Sticky 单飞（SLA = Sticky SLA，如 20s）
-  │    │       ├─ 有效首字 → 赢家 + 保持/续绑 Sticky → 流式透传
-  │    │       └─ 超时/明确失败 → 进入 Sticky-Discovery
-  │    │            · 首轮并行 N 家（排除原 Sticky 与已选）
-  │    │            · 本阶段 Discovery SLA = Sticky SLA（如 20s）
-  │    │            · 原 Sticky 若仍有可交付进展 → 只进兜底池，不进普通轮
-  │    └─ 否 → Cold Discovery
+  │    │       ├─ 有效首字 → 路径 L 赢家 + Sticky → 活流透传
+  │    │       └─ 超时/明确失败 → Sticky-Discovery
+  │    │            · 原 Sticky：不参加普通轮；继续/drain → 仅可入快照池
+  │    │            · 按 §4.0 开轮；第一轮 SLA = Sticky SLA
+  │    └─ 否 → Cold Discovery（SLA = Discovery SLA）
   │
-[Cold / 后续轮]
-  · 每轮固定 N，排除已选
-  · 轮 SLA = Discovery SLA（冷启动如 10s；Sticky 阶段第一轮例外用 Sticky SLA）
-  · 轮内有效首字 → 立即赢家 + Sticky + 透传；其它 in-flight → 输家策略（计费/取消），不进「普通竞赛」但可选择 drain 入池（见下）
-  · 轮内无有效首字 → 旧 attempt 继续后台；开下一轮
-  · 最后一轮：必须等到本轮候选「有效首字耗时」与池中最佳完整结果比较完毕
-       若本轮有效首字 T ≤ 池最佳 T_first → 本轮该 Provider 赢（可截断其它）
-       若本轮均 > 池最佳且池非空 → 完整回放池最佳
-       若池空 → 继续等 in-flight 直至可交付或终态失败
-
+[Discovery 轮 · 非最后一轮]
+  · 选 min(N, R) 家，排除已选；标记 isFinalRound=false
+  · 轮 SLA 内有效首字 → 路径 L（活流）+ Sticky；其它 attempt：cancel 或输家计费
+    （普通轮当场已有路径 L 时，通常不再为兜底保留全量快照，除非产品另开「并行计费 drain」）
+  · 轮 SLA 内无有效首字 → 当轮 attempt 转后台争入快照池；开下一轮
+  · 超 cap → 丢池资格 + cancel（§2.4）
+  │
+[Discovery 轮 · 最后一轮]  （§4.0）
+  · 选 min(N, R) 家（R=0 则无新 launch）
+  · 轮 SLA 仍生效：用于「当轮有效首字」竞赛窗与 T_first 采样
+  · 比较器（不得因旧池完整而跳过等待本轮窗）：
+      A. 本轮某候选在轮 SLA 内得到有效首字，且
+         T_first(候选) ≤ T_first(池最佳完整快照)（池空则视为通过）
+         → 路径 L：该候选活流赢家，截断其它
+      B. 本轮所有候选均在轮 SLA 内得到有效首字，且皆 >
+         T_first(池最佳)，且池非空
+         → 路径 S：整包回放池最佳
+      C. 轮 SLA 结束时：部分候选无有效首字
+         → 无首字者转后台；已有首字者按 A/B 与池比较；
+            若尚不能决胜且池非空且所有「已出首字」均更差 → 路径 S；
+            若池空 → 进入「仅后台等待完整可交付」（上限=整体硬超时）
+      D. 池空且后台仍无完整可交付直至硬超时或全失败 → 终态 §3
+  │
 [Fake 200 / 无效]
-  · 不进赢家、不进兜底池、不绑 Sticky；记失败链
-
+  · 不进路径 L 赢家、不进快照池、不绑 Sticky
+  │
 [终态失败]
   · 见 §3
 ```
 
-**闭环判断：在采用 §2 完整快照兜底 + §3 分层终态后，规则集合自洽，无「有结果却无法交付」或「无结果却 200」的空洞。**
+**闭环判断：在采用 §2 双路径 + §3 分层终态 + §4.0 最后一轮定义后，规则集合自洽；活流与快照交付不再混写。**
 
 ### 4.2 与已确认规则的逐条闭合
 
 | 规则 | 闭环？ | 备注 |
 |------|--------|------|
-| 每轮固定 N，排除已选 | ✅ | 现有 `launchedProviderIds` + `selectAlternative` 可扩展为批量 N |
-| 普通轮 Discovery SLA 内有效首字 → 赢 + Sticky | ✅ | 需把「非空字节」升级为「有效首字」检测 |
-| 旧轮不参加普通竞赛，但参与最终兜底 | ✅ | 依赖 §2 快照池；**禁止**旧轮完整结果直接掐断最后一轮 |
-| 最后一轮按首字耗时比，旧完整不自动结束 | ✅ | 比较器：`T_first`，准入：完整可交付 |
-| 兜底可成为 Sticky | ✅ | 与现网 `updateSessionBindingSmart` 一致 |
-| Sticky 超时 → Sticky SLA 的 Discovery；原 Sticky 只进兜底 | ✅ | 需区分 `phase: sticky | sticky_discovery | cold` |
-| Fake 200 不进赢家/兜底 | ✅ | 需前移部分检测；完整校验在入池时强制 |
+| 每轮固定 N，排除已选 | ✅ | `R < N` 时最后一轮选 R 家 |
+| 普通轮 Discovery SLA 内有效首字 → 赢 + Sticky | ✅ | 路径 L |
+| 旧轮不参加普通竞赛，但参与最终兜底 | ✅ | 仅路径 S；禁止旧完整直接掐断最后一轮比较窗 |
+| 最后一轮按首字耗时比，旧完整不自动结束 | ✅ | §4.0 + 比较器 A/B/C |
+| 兜底可成为 Sticky | ✅ | 路径 S 同样绑 Sticky |
+| Sticky 超时 → Sticky SLA 的 Discovery；原 Sticky 只进兜底 | ✅ | pool-only + 路径 S |
+| Fake 200 不进赢家/兜底 | ✅ | 两路径均剔除 |
 
-### 4.3 关键缺口（闭环上的「实现缺口」，不是业务逻辑漏洞）
+### 4.3 关键缺口（实现缺口，非业务逻辑漏洞）
 
 1. **有效首字定义**（协议级）仍粗：现网赢家条件过宽。  
-   - 建议入池/夺冠最小集（与 `fake-streaming/response-validator` / 各 family 对齐）：  
-     - Anthropic：非 error 的 `content_block_start`（非空类型 tool_use 等）或带 text/`partial_json` 的 `content_block_delta`；**单独 `message_start` 不足**（与 usage 过早出现的现网注释一致）。  
-     - OpenAI Chat：`choices[].delta` 含 content/tool_calls 等可交付。  
-     - OpenAI Responses：可交付 output 事件。  
-     - Gemini：candidates parts 可交付。  
-   - 强 fake 信号（HTML、顶层 error 非空、空 body）在**首块/首事件**即可淘汰 attempt。
+   - 建议夺冠/入池最小集（与 `fake-streaming/response-validator` / 各 family 对齐）：  
+     - Anthropic：非 error 的 `content_block_start`（tool_use 等）或带 text/`partial_json` 的 `content_block_delta`；**单独 `message_start` 不足**。  
+     - OpenAI Chat：`choices[].delta` 含 content/tool_calls 等。  
+     - OpenAI Responses / Gemini：各自可交付事件/parts。  
+   - 强 fake 信号在首块/首事件即可淘汰 attempt。
 
 2. **每轮并行 N**：现网是 1 + 超时后再 1，需调度器改造。  
 
-3. **整体硬超时**：现网多为单 Provider first-byte / 非流式 total，缺 racing 级 deadline。  
+3. **整体硬超时**：现网缺 racing 级 deadline；生产必配以防末轮慢连接挂死。  
 
-4. **多 attempt 完整缓冲**：现网输家 drain 为计费，不为回放；需独立「兜底快照」通道与 cap。  
+4. **多 attempt 完整缓冲**：现网输家 drain 为计费，不为回放；需独立快照通道与 cap（超 cap cancel）。  
 
-5. **Sticky SLA ≠ Provider.firstByteTimeoutStreamingMs 混用**：目标要求 Discovery 与 Sticky 分配置；静默期超时不复用 —— 需配置模型扩展（本次不设计表结构细节）。
+5. **Sticky SLA ≠ Discovery SLA 分配置**；静默期超时不复用。
 
 ---
 
@@ -208,48 +279,51 @@
 
 - Shadow session / attempt 隔离、agent 引用计数、client abort 扇出。  
 - 输家计费与 `hedge_losers` 账务。  
-- 决策链 reason：`hedge_triggered` / `hedge_launched` / `hedge_winner` / `hedge_loser_*`（可增 `discovery_round` / `fallback_winner` / `sticky_discovery`）。  
+- 决策链 reason：可增 `discovery_round` / `final_round` / `live_winner` / `fallback_winner` / `sticky_discovery` / `fallback_buffer_cap_exceeded`。  
 - Fake 200 检测库与 circuit / 清 Sticky 绑定侧效应。  
 - Provider 排除选择：`pickRandomProviderWithExclusion`。  
-- 终态 503 文案与 client-safe 映射。
+- 终态 503 文案与 client-safe 映射；**路径 L** 可继续用 `buildBufferedFirstChunkStream`。
 
-### 5.2 需新增/大改（工作量粗估，供排期）
+### 5.2 需新增/大改（工作量粗估）
 
 | 模块 | 改动 | 风险 |
 |------|------|------|
-| Racing 调度器 | 轮次、N 并行、phase、SLA 双轨、最后一轮比较器 | 高：状态并发、与现 hedge 互斥替换 |
-| 有效首字门闸 | 流上增量 parse（有界） | 中：误判会导致慢切换或错杀 |
-| 兜底快照池 | 完整 buffer + 校验 + 整包 Response | 中：内存；需 cap 与背压 |
-| Sticky 阶段 | 超时后不立刻 abort 原 Sticky，改为 pool-only | 中：与现「赢家即 abortAll」相反 |
-| 配置 | Discovery SLA、Sticky SLA、N、total deadline、buffer cap | 低 |
-| 测试 | 多轮时序、最后一轮不提前结束、fake 200 不入池、503/499 | 高：应用现有 hedge 单测模式扩展 |
+| Racing 调度器 | 轮次、N 并行、`isFinalRound`、SLA 双轨、末轮比较器 A–D | 高 |
+| 有效首字门闸 | 流上增量 parse（有界） | 中 |
+| 快照池 | 完整 buffer + 校验 + 路径 S Response；cap → cancel | 中 |
+| 路径 L/S 分支 | 决胜点显式枚举，禁止混用回放 | 中（文档/单测约束） |
+| Sticky 阶段 | 原 Sticky pool-only | 中 |
+| 配置 | Discovery/Sticky SLA、N、maxRounds、total deadline、buffer cap | 低 |
+| 测试 | 末轮不提前结束、路径 L 非回放、超 cap cancel、503 契约 | 高 |
 
 ### 5.3 可行性结论
 
-- **业务方案在补齐 §2/§3 决策后可闭环。**  
-- **工程上可在现有 `sendStreamingWithHedge` 演进**，但不是参数微调：属于调度语义升级（并行轮次 + 延迟决胜 + 快照兜底）。  
-- **首期应砍掉半截回放**，把复杂度压在调度与入池校验；与现网「计费 drain」并行时注意 reader 所有权单一。  
-- **不建议**在未定义有效首字增量规则前上线「多轮兜底」，否则 fake 200 会重新污染 Sticky。
+- **业务方案在补齐 §2 双路径 / §3 / §4.0 后可闭环。**  
+- **工程上可在现有 hedge 演进**，属调度语义升级，非调参。  
+- **首期砍掉半截回放**；路径 L 沿用活流，路径 S 才整包回放。  
+- **不建议**在未定义有效首字规则前上线多轮兜底。
 
 ---
 
 ## 6. 总裁决（给产品 / 首席架构师对齐用）
 
-1. **暂存交付**：完整可重放快照 + 可交付校验；禁止默认半截回放。  
-2. **最终失败**：透传 abort/不可重试客户端错误；否则 503 统一不可用；整体硬超时建议 504；有快照则成功兜底。  
-3. **闭环**：竞速 →（可选）多轮 → 最后一轮首字比较 → 快照兜底 → Sticky；fake 200 全程剔除；Sticky 超时进 Sticky-Discovery 且原 Sticky 仅兜底 —— **逻辑闭环成立**。  
-4. **可行性**：现网 hedge/Sticky/fake-200/503 **可托底**；缺并行轮次、有效首字、快照池、双 SLA、总时限 —— **可做，需专项设计与测试，本次不编码。**
+1. **暂存交付（旧轮）**：完整可重放快照 + 校验；**当轮赢家活流续传**；二者禁止混用。  
+2. **超 cap**：丢兜底资格并 cancel，不保留假「活流赢」出口。  
+3. **最后一轮**：由 `R < N` / 用尽 / 可选 `maxDiscoveryRounds` 定义；末轮仍有轮 SLA 夺冠窗。  
+4. **最终失败**：默认透传 abort/不可重试，否则 **503**；**504 为 breaking 可选项，需产品+客户端确认后方可落地**。  
+5. **末轮慢连接**：轮 SLA 关闭路径 L 窗口；继续等完整可交付仅受 **整体硬超时**（及自然 settled）约束。  
+6. **闭环与可行性**：逻辑闭环成立；现网可托底；需专项实现，本次不编码。
 
 ---
 
 ## 7. 建议的后续实现顺序（仅建议）
 
-1. 固化有效首字与入池校验（单测矩阵按协议 family）。  
-2. 快照池 + 完整回放 + 内存 cap。  
-3. 多轮 N 调度 + 最后一轮比较器。  
+1. 固化有效首字与入池校验（按协议 family 单测）。  
+2. 快照池 + 路径 S 回放 + cap→cancel。  
+3. 调度器：N 轮次 + §4.0 `isFinalRound` + 比较器 A–D + 路径 L 活流。  
 4. Sticky 双 SLA 与 pool-only 原 Sticky。  
-5. 总 deadline 与终态错误表。  
-6. 可观测性：round、T_first、pool hit、fake_200 reject。
+5. `racingTotalDeadlineMs` 与终态错误表（默认 503）。  
+6. 可观测性：round、isFinalRound、T_first、live_vs_fallback、cap_exceeded、fake_200 reject。
 
 ---
 
