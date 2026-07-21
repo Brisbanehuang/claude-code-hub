@@ -4800,15 +4800,11 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       .mockResolvedValueOnce([pending])
       .mockResolvedValueOnce([replacement]);
 
-    const storageError = new UpstreamProxyError(
-      "invalid request: upstream storage failure",
-      400,
-      {
-        body: '{"error":{"message":"disk storage creation failed: failed to write to temp file; disk free-space floor reached"}}',
-        providerId: initial.id,
-        providerName: initial.name,
-      }
-    );
+    const storageError = new UpstreamProxyError("invalid request: upstream storage failure", 400, {
+      body: '{"error":{"message":"disk storage creation failed: failed to write to temp file; disk free-space floor reached"}}',
+      providerId: initial.id,
+      providerName: initial.name,
+    });
     const attemptsByProvider = new Map<number, number>();
     const doForward = vi.spyOn(
       ProxyForwarder as unknown as {

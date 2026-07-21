@@ -6399,10 +6399,7 @@ export class ProxyForwarder {
               }
               if (coordinator.activeAttempts.length === 0 && noMoreCandidates) {
                 await settleFailure(
-                  ProxyForwarder.resolveHedgeTerminalError(
-                    normalizedRetryError,
-                    retryErrorCategory
-                  )
+                  ProxyForwarder.resolveHedgeTerminalError(normalizedRetryError, retryErrorCategory)
                 );
               }
             }
