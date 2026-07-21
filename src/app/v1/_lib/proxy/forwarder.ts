@@ -6199,23 +6199,26 @@ export class ProxyForwarder {
                   : null
               : null;
           if (stickyWaveForFallback) stickyWaveForFallback.slots = concurrency;
-          lastError = error instanceof Error ? error : new Error(String(error));
-          lastErrorCategory = await categorizeErrorAsync(lastError);
+          const attemptError = error instanceof Error ? error : new Error(String(error));
+          const attemptErrorCategory = await categorizeErrorAsync(attemptError);
+          lastError = attemptError;
+          lastErrorCategory = attemptErrorCategory;
           const errorMessage =
-            lastError instanceof ProxyError
-              ? lastError.getDetailedErrorMessage()
-              : lastError.message;
+            attemptError instanceof ProxyError
+              ? attemptError.getDetailedErrorMessage()
+              : attemptError.message;
 
           if (attempt.endpointAudit.endpointId != null) {
-            const isTimeoutError = lastError instanceof ProxyError && lastError.statusCode === 524;
-            if (isTimeoutError || lastErrorCategory === ErrorCategory.SYSTEM_ERROR) {
-              await recordEndpointFailure(attempt.endpointAudit.endpointId, lastError).catch(
+            const isTimeoutError =
+              attemptError instanceof ProxyError && attemptError.statusCode === 524;
+            if (isTimeoutError || attemptErrorCategory === ErrorCategory.SYSTEM_ERROR) {
+              await recordEndpointFailure(attempt.endpointAudit.endpointId, attemptError).catch(
                 () => undefined
               );
             }
           }
 
-          if (lastErrorCategory === ErrorCategory.CLIENT_ABORT) {
+          if (attemptErrorCategory === ErrorCategory.CLIENT_ABORT) {
             attempt.pending = false;
             coordinator.cancelRequest();
             session.addProviderToChain(provider, {
@@ -6226,16 +6229,16 @@ export class ProxyForwarder {
             });
             cleanupAttempt(attempt, "client_abort");
             await settleFailure(
-              lastError instanceof ProxyError
-                ? lastError
+              attemptError instanceof ProxyError
+                ? attemptError
                 : new ProxyError("Request aborted by client", 499, undefined, true),
               { preserveBinding: true, cancellationKind: "client_abort" }
             );
             return;
           }
 
-          if (lastErrorCategory === ErrorCategory.LOCAL_OVERLOAD) {
-            const admission = findDbPoolAdmissionError(lastError);
+          if (attemptErrorCategory === ErrorCategory.LOCAL_OVERLOAD) {
+            const admission = findDbPoolAdmissionError(attemptError);
             const safeAdmissionMessage = admission?.message ?? "Database pool admission exceeded";
             session.addProviderToChain(provider, {
               ...attempt.endpointAudit,
@@ -6253,10 +6256,10 @@ export class ProxyForwarder {
               },
             });
             cleanupAttempt(attempt, null, {
-              statusCode: lastError instanceof ProxyError ? lastError.statusCode : 503,
+              statusCode: attemptError instanceof ProxyError ? attemptError.statusCode : 503,
               reason: "local_overload",
             });
-            await settleFailure(lastError, { preserveBinding: true });
+            await settleFailure(attemptError, { preserveBinding: true });
             return;
           }
 
@@ -6272,6 +6275,7 @@ export class ProxyForwarder {
           // request session, so retry the same attempt session rather than
           // creating a fresh unrectified shadow from the parent session.
           const rectifier = await tryApplyReactiveRectifier({
+            error: attemptError,
             provider,
             requestSession: attempt.session,
             persistSession: session,
@@ -6305,7 +6309,7 @@ export class ProxyForwarder {
             }
             attempt.pending = false;
             cleanupAttempt(attempt, null, {
-              statusCode: lastError instanceof ProxyError ? lastError.statusCode : undefined,
+              statusCode: attemptError instanceof ProxyError ? attemptError.statusCode : undefined,
               reason: "rectifier_retry",
             });
             session.addProviderToChain(provider, {
@@ -6313,7 +6317,7 @@ export class ProxyForwarder {
                 provider,
                 attempt.endpointAudit,
                 attempt.sequence,
-                lastError,
+                attemptError,
                 errorMessage,
                 rectifier.requestDetailsBeforeRectify,
                 rawCrossProviderFallbackEnabled
@@ -6329,23 +6333,25 @@ export class ProxyForwarder {
               });
             } catch (retryLaunchError) {
               if (retrySetupReservation.cancellationKind || committed || settled) return;
-              lastError =
+              const normalizedRetryError =
                 retryLaunchError instanceof Error
                   ? retryLaunchError
                   : new Error(String(retryLaunchError));
-              lastErrorCategory = await categorizeErrorAsync(lastError);
-              if (lastErrorCategory === ErrorCategory.CLIENT_ABORT) {
+              const retryErrorCategory = await categorizeErrorAsync(normalizedRetryError);
+              lastError = normalizedRetryError;
+              lastErrorCategory = retryErrorCategory;
+              if (retryErrorCategory === ErrorCategory.CLIENT_ABORT) {
                 coordinator.cancelRequest();
                 await settleFailure(
-                  lastError instanceof ProxyError
-                    ? lastError
+                  normalizedRetryError instanceof ProxyError
+                    ? normalizedRetryError
                     : new ProxyError("Request aborted by client", 499, undefined, true),
                   { preserveBinding: true, cancellationKind: "client_abort" }
                 );
                 return;
               }
-              if (lastErrorCategory === ErrorCategory.LOCAL_OVERLOAD) {
-                await settleFailure(lastError, { preserveBinding: true });
+              if (retryErrorCategory === ErrorCategory.LOCAL_OVERLOAD) {
+                await settleFailure(normalizedRetryError, { preserveBinding: true });
                 return;
               }
               if (stickyProbeActive && provider.id === initialProvider.id) {
@@ -6393,7 +6399,10 @@ export class ProxyForwarder {
               }
               if (coordinator.activeAttempts.length === 0 && noMoreCandidates) {
                 await settleFailure(
-                  ProxyForwarder.resolveHedgeTerminalError(lastError, lastErrorCategory)
+                  ProxyForwarder.resolveHedgeTerminalError(
+                    normalizedRetryError,
+                    retryErrorCategory
+                  )
                 );
               }
             }
@@ -6414,29 +6423,29 @@ export class ProxyForwarder {
             ...attempt.endpointAudit,
             reason: "retry_failed",
             attemptNumber: attempt.sequence,
-            statusCode: lastError instanceof ProxyError ? lastError.statusCode : undefined,
+            statusCode: attemptError instanceof ProxyError ? attemptError.statusCode : undefined,
             errorMessage,
           });
           if (
-            !(lastError instanceof DiscoveryValidityLimitError) &&
-            lastErrorCategory === ErrorCategory.PROVIDER_ERROR &&
-            !(lastError instanceof ProxyError && lastError.statusCode === 404)
+            !(attemptError instanceof DiscoveryValidityLimitError) &&
+            attemptErrorCategory === ErrorCategory.PROVIDER_ERROR &&
+            !(attemptError instanceof ProxyError && attemptError.statusCode === 404)
           ) {
-            await recordFailure(provider.id, lastError).catch(() => undefined);
+            await recordFailure(provider.id, attemptError).catch(() => undefined);
           }
           cleanupAttempt(attempt, null, {
-            statusCode: lastError instanceof ProxyError ? lastError.statusCode : undefined,
+            statusCode: attemptError instanceof ProxyError ? attemptError.statusCode : undefined,
             reason:
-              lastErrorCategory == null
+              attemptErrorCategory == null
                 ? "unknown_error"
-                : ErrorCategory[lastErrorCategory].toLowerCase(),
+                : ErrorCategory[attemptErrorCategory].toLowerCase(),
           });
-          if (lastErrorCategory === ErrorCategory.NON_RETRYABLE_CLIENT_ERROR) {
+          if (attemptErrorCategory === ErrorCategory.NON_RETRYABLE_CLIENT_ERROR) {
             // Client/input errors are independent of the selected provider.
             // Stop Discovery immediately so the same invalid request is not
             // fanned out or masked by a later generic fallback error.
             await settleFailure(
-              ProxyForwarder.resolveHedgeTerminalError(lastError, lastErrorCategory),
+              ProxyForwarder.resolveHedgeTerminalError(attemptError, attemptErrorCategory),
               { preserveBinding: true }
             );
             return;
@@ -6490,7 +6499,7 @@ export class ProxyForwarder {
           }
           if (coordinator.activeAttempts.length === 0 && noMoreCandidates) {
             await settleFailure(
-              ProxyForwarder.resolveHedgeTerminalError(lastError, lastErrorCategory)
+              ProxyForwarder.resolveHedgeTerminalError(attemptError, attemptErrorCategory)
             );
           }
         })

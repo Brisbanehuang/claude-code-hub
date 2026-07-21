@@ -4773,6 +4773,83 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
     }
   });
 
+  test("Discovery bypasses request rectifiers for an upstream storage-capacity 400", async () => {
+    const initial = createProvider({ id: 1, name: "storage-full", priority: 1 });
+    const pending = createProvider({ id: 2, name: "pending", priority: 1 });
+    const replacement = createProvider({ id: 3, name: "replacement", priority: 1 });
+    const session = createSession();
+    session.authState = {
+      success: true,
+      user: null,
+      key: { id: 22 },
+      apiKey: null,
+    } as typeof session.authState;
+    session.setProvider(initial);
+    withThinkingBlocks(session);
+    mocks.getCachedSystemSettings.mockResolvedValue({
+      discoveryEnabled: true,
+      discoveryConcurrency: 2,
+      maxDiscoveryRounds: 1,
+      discoverySlaMs: 100,
+      stickySlaMs: 100,
+      racingTotalTimeoutMs: 500,
+      stickyTimeoutCooldownMs: 300_000,
+      enableThinkingSignatureRectifier: true,
+    });
+    mocks.pickDiscoveryProviders
+      .mockResolvedValueOnce([pending])
+      .mockResolvedValueOnce([replacement]);
+
+    const storageError = new UpstreamProxyError(
+      "invalid request: upstream storage failure",
+      400,
+      {
+        body: '{"error":{"message":"disk storage creation failed: failed to write to temp file; disk free-space floor reached"}}',
+        providerId: initial.id,
+        providerName: initial.name,
+      }
+    );
+    const attemptsByProvider = new Map<number, number>();
+    const doForward = vi.spyOn(
+      ProxyForwarder as unknown as {
+        doForward: (...args: unknown[]) => Promise<Response>;
+      },
+      "doForward"
+    );
+    doForward.mockImplementation(async (attemptSession) => {
+      const providerId = (attemptSession as ProxySession).provider?.id;
+      if (providerId == null) throw new Error("missing provider");
+      attemptsByProvider.set(providerId, (attemptsByProvider.get(providerId) ?? 0) + 1);
+      if (providerId === initial.id) throw storageError;
+      if (providerId === replacement.id) {
+        return new Response(
+          'data: {"type":"content_block_delta","delta":{"text":"replacement"}}\n\n',
+          { headers: { "content-type": "text/event-stream" } }
+        );
+      }
+      return new Response(new ReadableStream<Uint8Array>(), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    });
+
+    const response = await ProxyForwarder.send(session);
+
+    expect(await response.text()).toContain('"replacement"');
+    expect(attemptsByProvider.get(initial.id)).toBe(1);
+    expect(doForward).toHaveBeenCalledTimes(3);
+    expect(mocks.pickDiscoveryProviders).toHaveBeenNthCalledWith(
+      2,
+      expect.anything(),
+      1,
+      expect.arrayContaining([initial.id, pending.id])
+    );
+    expect(mocks.recordFailure).toHaveBeenCalledWith(initial.id, storageError);
+    expect(mocks.storeSessionSpecialSettings).not.toHaveBeenCalled();
+    expect(
+      session.getProviderChain().some((entry) => entry.reason === "client_error_non_retryable")
+    ).toBe(false);
+  });
+
   test("Discovery transfers the Provider session ref when a rectifier retries the same Provider", async () => {
     const initial = createProvider({
       id: 1,
