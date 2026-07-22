@@ -167,6 +167,7 @@ vi.mock("@/app/v1/_lib/proxy/errors", async (importOriginal) => {
 });
 
 import {
+  ALL_PROVIDERS_UNAVAILABLE_MESSAGE,
   ErrorCategory as ProxyErrorCategory,
   ProxyError as UpstreamProxyError,
   getErrorDetectionResultAsync,
@@ -4323,6 +4324,169 @@ describe("ProxyForwarder - first-byte hedge scheduling", () => {
       mocks.releaseProviderSession.mockImplementation(async () => {});
       vi.useRealTimers();
     }
+  });
+
+  test("a Provider-local model 404 cannot cancel a ready fallback in a later Discovery round", async () => {
+    vi.useFakeTimers();
+    try {
+      const fallback = createProvider({ id: 1, name: "fallback", priority: 1 });
+      const firstRoundPeer1 = createProvider({ id: 2, name: "first-round-peer-1", priority: 1 });
+      const firstRoundPeer2 = createProvider({ id: 3, name: "first-round-peer-2", priority: 1 });
+      const local404 = createProvider({ id: 4, name: "provider-local-404", priority: 1 });
+      const pendingNormal = createProvider({ id: 5, name: "pending-normal", priority: 1 });
+      const session = createSession();
+      session.authState = {
+        success: true,
+        user: null,
+        key: { id: 42 },
+        apiKey: null,
+      } as typeof session.authState;
+      session.setProvider(fallback);
+      mocks.getCachedSystemSettings.mockResolvedValue({
+        discoveryEnabled: true,
+        discoveryConcurrency: 3,
+        maxDiscoveryRounds: 2,
+        discoverySlaMs: 10,
+        stickySlaMs: 10,
+        racingTotalTimeoutMs: 100,
+        stickyTimeoutCooldownMs: 300_000,
+      });
+      mocks.pickDiscoveryProviders
+        .mockResolvedValueOnce([firstRoundPeer1, firstRoundPeer2])
+        .mockResolvedValueOnce([local404, pendingNormal]);
+
+      const actualErrors = await vi.importActual<typeof import("@/app/v1/_lib/proxy/errors")>(
+        "@/app/v1/_lib/proxy/errors"
+      );
+      mocks.categorizeErrorAsync.mockImplementation(actualErrors.categorizeErrorAsync);
+
+      let fallbackController: ReadableStreamDefaultController<Uint8Array> | null = null;
+      const launchedProviderIds: number[] = [];
+      const doForward = vi.spyOn(
+        ProxyForwarder as unknown as {
+          doForward: (...args: unknown[]) => Promise<Response>;
+        },
+        "doForward"
+      );
+      doForward.mockImplementation(async (attemptSession) => {
+        const providerId = (attemptSession as ProxySession).provider!.id;
+        launchedProviderIds.push(providerId);
+        if (providerId === local404.id) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          throw new UpstreamProxyError(
+            "not supported by any configured account in this group",
+            404,
+            {
+              body: '{"error":{"message":"invalid request: not supported by any configured account in this group"}}',
+              providerId: local404.id,
+              providerName: local404.name,
+            }
+          );
+        }
+        if (providerId === fallback.id) {
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                fallbackController = controller;
+              },
+            }),
+            { headers: { "content-type": "text/event-stream" } }
+          );
+        }
+        return new Response(new ReadableStream<Uint8Array>(), {
+          headers: { "content-type": "text/event-stream" },
+        });
+      });
+
+      let responseSettled = false;
+      const responsePromise = ProxyForwarder.send(session).finally(() => {
+        responseSettled = true;
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(launchedProviderIds).toEqual([
+        fallback.id,
+        firstRoundPeer1.id,
+        firstRoundPeer2.id,
+        local404.id,
+        pendingNormal.id,
+      ]);
+
+      fallbackController?.enqueue(
+        new TextEncoder().encode(
+          'data: {"type":"content_block_delta","delta":{"text":"fallback-winner"}}\n\n'
+        )
+      );
+      fallbackController?.close();
+      await vi.advanceTimersByTimeAsync(5);
+
+      expect(responseSettled).toBe(false);
+      expect(mocks.recordFailure).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(5);
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain('"fallback-winner"');
+      expect(mocks.recordFailure).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("all Provider-local model 404s converge to the generic Discovery 503 without circuit accounting", async () => {
+    const provider1 = createProvider({ id: 1, name: "local-404-1", priority: 1 });
+    const provider2 = createProvider({ id: 2, name: "local-404-2", priority: 1 });
+    const provider3 = createProvider({ id: 3, name: "local-404-3", priority: 1 });
+    const session = createSession();
+    session.authState = {
+      success: true,
+      user: null,
+      key: { id: 43 },
+      apiKey: null,
+    } as typeof session.authState;
+    session.setProvider(provider1);
+    mocks.getCachedSystemSettings.mockResolvedValue({
+      discoveryEnabled: true,
+      discoveryConcurrency: 3,
+      maxDiscoveryRounds: 2,
+      discoverySlaMs: 100,
+      stickySlaMs: 100,
+      racingTotalTimeoutMs: 500,
+      stickyTimeoutCooldownMs: 300_000,
+    });
+    mocks.pickDiscoveryProviders
+      .mockResolvedValueOnce([provider2, provider3])
+      .mockResolvedValue([]);
+
+    const actualErrors = await vi.importActual<typeof import("@/app/v1/_lib/proxy/errors")>(
+      "@/app/v1/_lib/proxy/errors"
+    );
+    mocks.categorizeErrorAsync.mockImplementation(actualErrors.categorizeErrorAsync);
+
+    const attemptedProviderIds: number[] = [];
+    vi.spyOn(
+      ProxyForwarder as unknown as {
+        doForward: (...args: unknown[]) => Promise<Response>;
+      },
+      "doForward"
+    ).mockImplementation(async (attemptSession) => {
+      const provider = (attemptSession as ProxySession).provider!;
+      attemptedProviderIds.push(provider.id);
+      throw new UpstreamProxyError("not supported by any configured account in this group", 404, {
+        body: '{"error":{"message":"invalid request: not supported by any configured account in this group"}}',
+        providerId: provider.id,
+        providerName: provider.name,
+      });
+    });
+
+    const error = await ProxyForwarder.send(session).catch(
+      (caught) => caught as UpstreamProxyError
+    );
+
+    expect(error).toBeInstanceOf(UpstreamProxyError);
+    expect(error.statusCode).toBe(503);
+    expect(error.message).toBe(ALL_PROVIDERS_UNAVAILABLE_MESSAGE);
+    expect(attemptedProviderIds.sort((a, b) => a - b)).toEqual([1, 2, 3]);
+    expect(mocks.recordFailure).not.toHaveBeenCalled();
   });
 
   test("a failing fallback waits for the queued next wave handoff", async () => {

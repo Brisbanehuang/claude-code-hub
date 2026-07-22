@@ -584,6 +584,25 @@ function extractErrorContentForDetection(error: Error): string {
  */
 const errorDetectionCache = new WeakMap<Error, ErrorDetectionResult>();
 
+const PROVIDER_LOCAL_MODEL_UNAVAILABLE_MARKER =
+  "not supported by any configured account in this group";
+
+/** A model capability gap local to one upstream account pool, not to the request. */
+export function isProviderLocalModelUnavailableError(error: unknown): error is ProxyError {
+  if (
+    !(error instanceof ProxyError) ||
+    error.statusCode !== 404 ||
+    error.upstreamError?.isSyntheticFake200 === true ||
+    error.upstreamError?.statusCodeInferred === true
+  ) {
+    return false;
+  }
+
+  return [error.message, error.upstreamError?.body].some((content) =>
+    content?.toLowerCase().includes(PROVIDER_LOCAL_MODEL_UNAVAILABLE_MARKER)
+  );
+}
+
 const RETRYABLE_UPSTREAM_STORAGE_ERROR_MARKERS = [
   "disk storage creation failed",
   "disk free-space floor reached",
@@ -1002,6 +1021,13 @@ export async function categorizeErrorAsync(error: Error): Promise<ErrorCategory>
   // such as "invalid request" in the same response body.
   if (isRetryableUpstreamStorageCapacityError(error)) {
     return ErrorCategory.PROVIDER_ERROR;
+  }
+
+  // Some upstream account pools use model_not_found for a Provider-local capability
+  // gap. The request may still succeed elsewhere, so classify this exact 404 before
+  // broad client-input rules match the generic model_not_found wording.
+  if (isProviderLocalModelUnavailableError(error)) {
+    return ErrorCategory.RESOURCE_NOT_FOUND;
   }
 
   // 优先级 4: 不可重试的客户端输入错误检测（白名单模式）
