@@ -411,6 +411,13 @@
         },
         "discoveryTitle": "Раунды Discovery",
         "discoveryCompact": "{rounds} р. · {attempts} поп.",
+        "routeMode": "Способ маршрутизации",
+        "routeModes": {
+          "sticky": "Sticky",
+          "cold_start": "Холодный старт",
+          "rediscovery": "Повторное обнаружение"
+        },
+        "finalProvider": "Итоговый провайдер",
         "roundsLabel": "Раунды",
         "attemptsLabel": "Попытки",
         "winnerOrigin": "Источник победителя",
@@ -426,6 +433,11 @@
           "sticky": "Sticky",
           "normal": "Кандидат",
           "fallback": "Резерв"
+        },
+        "winnerSources": {
+          "sticky": "Sticky",
+          "normal": "Обычный кандидат",
+          "fallback": "Перехват резервным провайдером"
         },
         "roleTransition": "{from} → {to}",
         "outcomes": {
