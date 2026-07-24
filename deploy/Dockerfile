@@ -1,12 +1,12 @@
 # syntax=docker/dockerfile:1
 
-# 构建阶段：使用 Bun（快速包管理和构建）
-FROM --platform=$BUILDPLATFORM oven/bun:debian AS build-base
+# 构建阶段：固定到仓库 .bun-version 对应的多架构镜像，避免浮动标签升级破坏构建。
+FROM --platform=$BUILDPLATFORM oven/bun:1.3.10-debian@sha256:367842b35abbdf23f39e23c71f3a08eee940ff2679a14e08a5afcf4a1436cd89 AS build-base
 WORKDIR /app
 
 FROM build-base AS deps
-COPY package.json ./
-RUN bun install
+COPY package.json .bun-version ./
+RUN test "$(bun --version)" = "$(cat .bun-version)" && bun install
 
 FROM deps AS build
 COPY . .
