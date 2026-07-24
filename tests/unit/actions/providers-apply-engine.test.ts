@@ -133,6 +133,7 @@ function makeProvider(id: number, overrides: Record<string, unknown> = {}) {
     circuitBreakerHalfOpenSuccessThreshold: 2,
     proxyUrl: null,
     proxyFallbackToDirect: false,
+    customHeaders: null,
     firstByteTimeoutStreamingMs: 30000,
     streamingIdleTimeoutMs: 10000,
     requestTimeoutNonStreamingMs: 600000,
@@ -468,6 +469,148 @@ describe("Apply Provider Batch Patch Engine", () => {
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.errorCode).toBe(PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_STALE);
+  });
+
+  it("should carry billing probes through preview/apply and atomically bind connection fields", async () => {
+    const original = makeProvider(1, {
+      url: "https://billing.example/v1",
+      key: "sk-billing-secret",
+      proxyUrl: "http://proxy.example:8080",
+      proxyFallbackToDirect: true,
+      customHeaders: { "x-tenant": "tenant-a" },
+    });
+    findAllProvidersFreshMock.mockResolvedValue([original]);
+    const { issueProviderBillingProbeToken } = await import("@/lib/provider-billing-probe");
+    const issued = issueProviderBillingProbeToken({
+      provider: original,
+      snapshot: {
+        object: "sub2api.key_billing",
+        schemaVersion: 1,
+        billingScope: "token",
+        groupRateMultiplier: 0.08,
+        resolvedRateMultiplier: 0.08,
+        peakRateEnabled: false,
+        observedEffectiveRateMultiplier: 0.08,
+        currentEffectiveRateMultiplier: 0.08,
+        observedAt: new Date().toISOString(),
+      },
+    });
+    const billingProbes = [{ providerId: 1, probeToken: issued.token }];
+    const { previewProviderBatchPatch, applyProviderBatchPatch } = await import(
+      "@/actions/providers"
+    );
+    const preview = await previewProviderBatchPatch({
+      providerIds: [1],
+      patch: { cost_multiplier: { set: 0.08 } },
+      billingProbes,
+    });
+    if (!preview.ok) throw new Error(`Preview failed: ${preview.error}`);
+
+    const applied = await applyProviderBatchPatch({
+      previewToken: preview.data.previewToken,
+      previewRevision: preview.data.previewRevision,
+      providerIds: [1],
+      patch: { cost_multiplier: { set: 0.08 } },
+      billingProbes,
+    });
+
+    expect(applied.ok).toBe(true);
+    const transactionInput = applyProviderBatchOperationIfUnchangedMock.mock.calls[0][0];
+    expect(transactionInput.expectedPreimages[0].values).toMatchObject({
+      url: original.url,
+      key: original.key,
+      proxyUrl: original.proxyUrl,
+      proxyFallbackToDirect: true,
+      customHeaders: original.customHeaders,
+    });
+    expect(JSON.stringify(transactionInput.undoPreimage)).not.toContain(original.key);
+  });
+
+  it("should reject a changed provider connection before applying a billing observation", async () => {
+    const original = makeProvider(1, {
+      key: "sk-before",
+      customHeaders: null,
+    });
+    const rotated = makeProvider(1, {
+      key: "sk-after",
+      customHeaders: null,
+    });
+    const { issueProviderBillingProbeToken } = await import("@/lib/provider-billing-probe");
+    const issued = issueProviderBillingProbeToken({
+      provider: original,
+      snapshot: {
+        object: "sub2api.key_billing",
+        schemaVersion: 1,
+        billingScope: "token",
+        groupRateMultiplier: 0.08,
+        resolvedRateMultiplier: 0.08,
+        peakRateEnabled: false,
+        observedEffectiveRateMultiplier: 0.08,
+        currentEffectiveRateMultiplier: 0.08,
+        observedAt: new Date().toISOString(),
+      },
+    });
+    const billingProbes = [{ providerId: 1, probeToken: issued.token }];
+    findAllProvidersFreshMock.mockResolvedValueOnce([original]).mockResolvedValueOnce([rotated]);
+    const { previewProviderBatchPatch, applyProviderBatchPatch } = await import(
+      "@/actions/providers"
+    );
+    const preview = await previewProviderBatchPatch({
+      providerIds: [1],
+      patch: { cost_multiplier: { set: 0.08 } },
+      billingProbes,
+    });
+    if (!preview.ok) throw new Error(`Preview failed: ${preview.error}`);
+    const applied = await applyProviderBatchPatch({
+      previewToken: preview.data.previewToken,
+      previewRevision: preview.data.previewRevision,
+      providerIds: [1],
+      patch: { cost_multiplier: { set: 0.08 } },
+      billingProbes,
+    });
+
+    expect(applied.ok).toBe(false);
+    if (applied.ok) return;
+    expect(applied.errorCode).toBe(PROVIDER_BATCH_PATCH_ERROR_CODES.BILLING_PROBE_STALE);
+    expect(applyProviderBatchOperationIfUnchangedMock).not.toHaveBeenCalled();
+  });
+
+  it("should require apply to return the exact preview billing-probe set", async () => {
+    const original = makeProvider(1, { customHeaders: null });
+    findAllProvidersFreshMock.mockResolvedValue([original]);
+    const { issueProviderBillingProbeToken } = await import("@/lib/provider-billing-probe");
+    const issued = issueProviderBillingProbeToken({
+      provider: original,
+      snapshot: {
+        object: "sub2api.key_billing",
+        schemaVersion: 1,
+        billingScope: "token",
+        groupRateMultiplier: 0.08,
+        resolvedRateMultiplier: 0.08,
+        peakRateEnabled: false,
+        observedEffectiveRateMultiplier: 0.08,
+        currentEffectiveRateMultiplier: 0.08,
+        observedAt: new Date().toISOString(),
+      },
+    });
+    const { previewProviderBatchPatch, applyProviderBatchPatch } = await import(
+      "@/actions/providers"
+    );
+    const preview = await previewProviderBatchPatch({
+      providerIds: [1],
+      patch: { cost_multiplier: { set: 0.08 } },
+      billingProbes: [{ providerId: 1, probeToken: issued.token }],
+    });
+    if (!preview.ok) throw new Error(`Preview failed: ${preview.error}`);
+    const applied = await applyProviderBatchPatch({
+      previewToken: preview.data.previewToken,
+      previewRevision: preview.data.previewRevision,
+      providerIds: [1],
+      patch: { cost_multiplier: { set: 0.08 } },
+    });
+    expect(applied.ok).toBe(false);
+    if (applied.ok) return;
+    expect(applied.errorCode).toBe(PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_STALE);
   });
 
   it("should replay the durable result for the same key, preview, and payload", async () => {

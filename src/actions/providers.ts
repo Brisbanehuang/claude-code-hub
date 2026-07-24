@@ -30,6 +30,11 @@ import {
   PROVIDER_BATCH_PATCH_ERROR_CODES,
   SENSITIVE_PROVIDER_BATCH_UNDO_KEYS,
 } from "@/lib/provider-batch-patch-error-codes";
+import {
+  type ProviderBillingProbeBinding,
+  type ProviderBillingProbeConnection,
+  validateProviderBillingProbeBindings,
+} from "@/lib/provider-billing-probe";
 import { PROVIDER_MODEL_REDIRECT_RULE_LIST_SCHEMA } from "@/lib/provider-model-redirect-schema";
 import { normalizeProviderModelRedirectRules } from "@/lib/provider-model-redirects";
 import {
@@ -1329,10 +1334,18 @@ const ProviderBatchPatchProviderIdsSchema = z
   .min(1)
   .max(BATCH_OPERATION_MAX_SIZE);
 
+const ProviderBillingProbeBindingActionSchema = z
+  .object({
+    providerId: z.number().int().positive(),
+    probeToken: z.string().trim().min(1).max(16_384),
+  })
+  .strict();
+
 const PreviewProviderBatchPatchSchema = z
   .object({
     providerIds: ProviderBatchPatchProviderIdsSchema,
     patch: z.unknown().optional().default({}),
+    billingProbes: z.array(ProviderBillingProbeBindingActionSchema).max(500).optional().default([]),
   })
   .strict();
 
@@ -1344,6 +1357,7 @@ const ApplyProviderBatchPatchSchema = z
     patch: z.unknown().optional().default({}),
     idempotencyKey: z.string().trim().min(1).max(128).optional(),
     excludeProviderIds: z.array(z.number().int().positive()).optional().default([]),
+    billingProbes: z.array(ProviderBillingProbeBindingActionSchema).max(500).optional().default([]),
   })
   .strict();
 
@@ -1431,6 +1445,7 @@ interface ProviderBatchPatchPreviewSnapshot {
   rows: ProviderBatchPreviewRow[];
   providerTypes: Record<number, ProviderType>;
   providerEnabled: Record<number, boolean>;
+  billingProbes: ProviderBillingProbeBinding[];
 }
 
 interface ProviderPatchUndoSnapshot {
@@ -1566,6 +1581,26 @@ function isSameProviderIdList(left: number[], right: number[]): boolean {
   return true;
 }
 
+function canonicalizeBillingProbeBindings(
+  bindings: ProviderBillingProbeBinding[]
+): ProviderBillingProbeBinding[] {
+  return [...bindings].sort((left, right) => left.providerId - right.providerId);
+}
+
+function isSameBillingProbeBindings(
+  left: ProviderBillingProbeBinding[],
+  right: ProviderBillingProbeBinding[]
+): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function buildBillingProbeValidationError(stale: boolean): ProviderPatchActionError {
+  const errorCode = stale
+    ? PROVIDER_BATCH_PATCH_ERROR_CODES.BILLING_PROBE_STALE
+    : PROVIDER_BATCH_PATCH_ERROR_CODES.BILLING_PROBE_INVALID;
+  return { ok: false, error: errorCode, errorCode };
+}
+
 function createProviderBatchPreviewToken(): string {
   return `provider_patch_preview_${crypto.randomUUID()}`;
 }
@@ -1600,6 +1635,7 @@ function buildProviderBatchApplyFingerprint(input: {
   providerIds: number[];
   patch: ProviderBatchPatch;
   excludeProviderIds: number[];
+  billingProbes: ProviderBillingProbeBinding[];
 }): string {
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
@@ -1649,6 +1685,23 @@ function buildExpectedProviderBatchPreimages(
   }
 
   return { expected, undo };
+}
+
+function attachBillingProbeConnectionPreimages(
+  expectedPreimages: ProviderBatchExpectedPreimage[],
+  providersById: Map<number, ProviderBillingProbeConnection>
+): void {
+  for (const expected of expectedPreimages) {
+    const provider = providersById.get(expected.providerId);
+    if (!provider) continue;
+    Object.assign(expected.values, {
+      url: provider.url,
+      key: provider.key,
+      proxyUrl: provider.proxyUrl,
+      proxyFallbackToDirect: provider.proxyFallbackToDirect,
+      customHeaders: provider.customHeaders,
+    });
+  }
 }
 
 function mapApplyUpdatesToRepositoryFormat(
@@ -2197,12 +2250,24 @@ export async function previewProviderBatchPatch(
     }
 
     const providerIds = dedupeProviderIds(parsed.data.providerIds);
+    const billingProbes = canonicalizeBillingProbeBindings(parsed.data.billingProbes);
     const changedFields = getChangedPatchFields(normalizedPatch.data);
     const nowMs = Date.now();
 
     const allProviders = await findAllProvidersFresh();
     const providerIdSet = new Set(providerIds);
     const matchedProviders = allProviders.filter((p) => providerIdSet.has(p.id));
+    const billingProbeValidation = validateProviderBillingProbeBindings({
+      bindings: billingProbes,
+      providerIds,
+      providers: matchedProviders,
+    });
+    if (!billingProbeValidation.ok) {
+      return buildBillingProbeValidationError(
+        billingProbeValidation.reason === "expired" ||
+          billingProbeValidation.reason === "identity_changed"
+      );
+    }
     const rows = generatePreviewRows(matchedProviders, normalizedPatch.data, changedFields);
     const skipCount = rows.filter((r) => r.status === "skipped").length;
 
@@ -2224,6 +2289,7 @@ export async function previewProviderBatchPatch(
       providerEnabled: Object.fromEntries(
         matchedProviders.map((provider) => [provider.id, provider.isEnabled])
       ),
+      billingProbes,
     });
 
     return {
@@ -2277,6 +2343,7 @@ export async function applyProviderBatchPatch(
     }
 
     const providerIds = dedupeProviderIds(parsed.data.providerIds);
+    const billingProbes = canonicalizeBillingProbeBindings(parsed.data.billingProbes);
     const excludeProviderIds = dedupeProviderIds(parsed.data.excludeProviderIds ?? []);
     const claimKey = buildProviderBatchApplyClaimKey(
       parsed.data.previewToken,
@@ -2288,6 +2355,7 @@ export async function applyProviderBatchPatch(
       providerIds,
       patch: normalizedPatch.data,
       excludeProviderIds,
+      billingProbes,
     });
 
     const existingOperation = await findProviderBatchApplyOperation({
@@ -2322,8 +2390,12 @@ export async function applyProviderBatchPatch(
       parsed.data.previewRevision !== snapshot.previewRevision ||
       !isSameProviderIdList(providerIds, snapshot.providerIds) ||
       patchSerialized !== snapshot.patchSerialized;
+    const billingProbesStale = !isSameBillingProbeBindings(
+      billingProbes,
+      snapshot.billingProbes ?? []
+    );
 
-    if (isStale) {
+    if (isStale || billingProbesStale) {
       return {
         ok: false,
         error: PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_STALE,
@@ -2358,6 +2430,23 @@ export async function applyProviderBatchPatch(
         error: PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_STALE,
         errorCode: PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_STALE,
       };
+    }
+
+    if (billingProbes.length > 0) {
+      const currentProviders = await findAllProvidersFresh();
+      const currentProviderIdSet = new Set(providerIds);
+      const billingProbeValidation = validateProviderBillingProbeBindings({
+        bindings: billingProbes,
+        providerIds,
+        providers: currentProviders.filter((provider) => currentProviderIdSet.has(provider.id)),
+      });
+      if (!billingProbeValidation.ok) {
+        return buildBillingProbeValidationError(true);
+      }
+      attachBillingProbeConnectionPreimages(
+        preimages.expected,
+        billingProbeValidation.providersById
+      );
     }
 
     const repositoryUpdates = mapApplyUpdatesToRepositoryFormat(updatesResult.data);
