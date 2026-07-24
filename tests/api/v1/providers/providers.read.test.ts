@@ -35,6 +35,7 @@ const addProviderMock = vi.hoisted(() => vi.fn());
 const editProviderMock = vi.hoisted(() => vi.fn());
 const removeProviderMock = vi.hoisted(() => vi.fn());
 const validateAuthTokenMock = vi.hoisted(() => vi.fn());
+const probeProviderBillingByIdsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/actions/providers", () => ({
   getProviders: getProvidersMock,
@@ -77,6 +78,10 @@ vi.mock("@/lib/auth", async (importOriginal) => {
     validateAuthToken: validateAuthTokenMock,
   };
 });
+
+vi.mock("@/lib/provider-billing-probe", () => ({
+  probeProviderBillingByIds: probeProviderBillingByIdsMock,
+}));
 
 const { callV1Route } = await import("../test-utils");
 
@@ -217,6 +222,19 @@ describe("v1 providers read endpoints", () => {
     previewProviderBatchPatchMock.mockResolvedValue({
       ok: true,
       data: { previewToken: "preview", previewRevision: "rev", rows: [] },
+    });
+    probeProviderBillingByIdsMock.mockResolvedValue({
+      results: [
+        {
+          providerId: 1,
+          providerName: "Anthropic primary",
+          status: "ok",
+          effectiveRateMultiplier: 0.08,
+          observedAt: "2026-07-24T12:00:00.000Z",
+          probeToken: "pbp1.payload.signature",
+          probeExpiresAt: "2026-07-24T12:05:00.000Z",
+        },
+      ],
     });
     applyProviderBatchPatchMock.mockResolvedValue({
       ok: true,
@@ -971,6 +989,53 @@ describe("v1 providers read endpoints", () => {
     });
     expect(recluster.response.status).toBe(200);
     expect(reclusterProviderVendorsMock).toHaveBeenCalledWith({ confirm: false });
+  });
+
+  test("probes stored provider billing through an admin-only bounded endpoint", async () => {
+    const probed = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeBilling",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [1, 3] },
+    });
+    expect(probed.response.status).toBe(200);
+    expect(probed.response.headers.get("cache-control")).toContain("no-store");
+    expect(probeProviderBillingByIdsMock).toHaveBeenCalledWith([1, 3]);
+    expect(probed.json).toMatchObject({ results: [{ status: "ok" }] });
+
+    const hidden = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeBilling",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [2] },
+    });
+    expect(hidden.response.status).toBe(404);
+    expect(hidden.json).toMatchObject({ errorCode: "provider.not_found" });
+    expect(probeProviderBillingByIdsMock).not.toHaveBeenCalledWith([2]);
+
+    const tooLarge = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeBilling",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: Array.from({ length: 21 }, (_, index) => index + 1) },
+    });
+    expect(tooLarge.response.status).toBe(400);
+
+    const duplicate = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeBilling",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [1, 1] },
+    });
+    expect(duplicate.response.status).toBe(400);
+
+    validateAuthTokenMock.mockResolvedValueOnce(null);
+    const unauthorized = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeBilling",
+      body: { providerIds: [1] },
+    });
+    expect(unauthorized.response.status).toBe(401);
   });
 
   test("exposes provider API test operations", async () => {

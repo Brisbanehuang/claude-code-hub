@@ -7,6 +7,8 @@ export function getProviderBatchErrorTranslationKey(errorCode?: string) {
     case PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_EXPIRED:
       return "errors.previewExpired" as const;
     case PROVIDER_BATCH_PATCH_ERROR_CODES.PREVIEW_STALE:
+    case PROVIDER_BATCH_PATCH_ERROR_CODES.BILLING_PROBE_INVALID:
+    case PROVIDER_BATCH_PATCH_ERROR_CODES.BILLING_PROBE_STALE:
       return "errors.previewStale" as const;
     case PROVIDER_BATCH_PATCH_ERROR_CODES.IDEMPOTENCY_CONFLICT:
       return "errors.idempotencyConflict" as const;

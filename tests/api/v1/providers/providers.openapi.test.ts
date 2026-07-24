@@ -26,6 +26,7 @@ describe("v1 providers OpenAPI", () => {
     expect(doc.paths).toHaveProperty("/api/v1/providers:undoDelete");
     expect(doc.paths).toHaveProperty("/api/v1/providers:batchPatch:preview");
     expect(doc.paths).toHaveProperty("/api/v1/providers:batchPatch:apply");
+    expect(doc.paths).toHaveProperty("/api/v1/providers:probeBilling");
     expect(doc.paths).toHaveProperty("/api/v1/providers:undoPatch");
     expect(doc.paths).toHaveProperty("/api/v1/providers/test:proxy");
     expect(doc.paths).toHaveProperty("/api/v1/providers/test:unified");

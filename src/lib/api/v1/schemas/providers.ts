@@ -197,6 +197,61 @@ export const ProviderIdsBodySchema = z
   })
   .strict();
 
+export const ProviderBillingProbeRequestSchema = z
+  .object({
+    providerIds: z
+      .array(z.number().int().positive())
+      .min(1)
+      .max(20)
+      .refine((ids) => new Set(ids).size === ids.length, "Provider ids must be unique.")
+      .describe("One to twenty unique provider ids."),
+  })
+  .strict();
+
+export const ProviderBillingProbeBindingSchema = z
+  .object({
+    providerId: z.number().int().positive().describe("Provider id bound to this probe token."),
+    probeToken: z.string().trim().min(1).max(16_384).describe("Short-lived billing probe token."),
+  })
+  .strict();
+
+const ProviderBillingProbeSuccessSchema = z
+  .object({
+    providerId: z.number().int().positive(),
+    providerName: z.string(),
+    status: z.literal("ok"),
+    effectiveRateMultiplier: z.number().nonnegative(),
+    observedAt: z.string().datetime({ offset: true }),
+    probeToken: z.string(),
+    probeExpiresAt: z.string().datetime({ offset: true }),
+  })
+  .strict();
+
+const ProviderBillingProbeFailureSchema = z
+  .object({
+    providerId: z.number().int().positive(),
+    providerName: z.string(),
+    status: z.enum([
+      "unsupported",
+      "unauthorized",
+      "timeout",
+      "http_error",
+      "invalid_response",
+      "provider_disabled",
+    ]),
+    errorCode: z.string(),
+    httpStatus: z.number().int().min(100).max(599).optional(),
+  })
+  .strict();
+
+export const ProviderBillingProbeResponseSchema = z
+  .object({
+    results: z.array(
+      z.union([ProviderBillingProbeSuccessSchema, ProviderBillingProbeFailureSchema])
+    ),
+  })
+  .strict();
+
 const ProviderBatchUpdateFieldsSchema = z
   .object({
     is_enabled: z.boolean().optional().describe("Provider enabled state."),
@@ -252,6 +307,11 @@ export const ProviderBatchPatchPreviewSchema = z
   .object({
     providerIds: z.array(z.number().int().positive()).min(1).max(500).describe("Provider ids."),
     patch: z.record(z.string(), z.unknown()).default({}).describe("Batch patch draft."),
+    billingProbes: z
+      .array(ProviderBillingProbeBindingSchema)
+      .max(500)
+      .optional()
+      .describe("Optional direct-billing observations bound to this preview."),
   })
   .strict();
 
@@ -272,6 +332,11 @@ export const ProviderBatchPatchApplySchema = z
       .array(z.number().int().positive())
       .optional()
       .describe("Optional provider ids to exclude when applying."),
+    billingProbes: z
+      .array(ProviderBillingProbeBindingSchema)
+      .max(500)
+      .optional()
+      .describe("The exact direct-billing observations supplied to the preview."),
   })
   .strict();
 

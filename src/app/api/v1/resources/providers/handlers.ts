@@ -29,6 +29,7 @@ import {
   ProviderBatchPatchApplySchema,
   ProviderBatchPatchPreviewSchema,
   ProviderBatchUpdateSchema,
+  ProviderBillingProbeRequestSchema,
   ProviderConfirmBodySchema,
   ProviderCreateSchema,
   ProviderFetchUpstreamModelsSchema,
@@ -424,6 +425,26 @@ export async function applyBatchPatch(c: Context): Promise<Response> {
     c,
     await callAction(c, providerActions.applyProviderBatchPatch, [body] as never[], c.get("auth"))
   );
+}
+
+export async function probeProviderBilling(c: Context): Promise<Response> {
+  const body = await parseJson(c, ProviderBillingProbeRequestSchema);
+  if (body instanceof Response) return body;
+  const visibilityError = await ensureVisibleProviderIds(c, body.providerIds);
+  if (visibilityError) return visibilityError;
+  try {
+    const { probeProviderBillingByIds } = await import("@/lib/provider-billing-probe");
+    return jsonResponse(await probeProviderBillingByIds(body.providerIds), {
+      headers: withNoStoreHeaders(),
+    });
+  } catch {
+    return createProblemResponse({
+      status: 500,
+      instance: new URL(c.req.url).pathname,
+      errorCode: "provider.billing_probe_failed",
+      detail: "Provider billing probes could not be completed.",
+    });
+  }
 }
 
 export async function undoProviderBatchPatch(c: Context): Promise<Response> {
@@ -853,6 +874,7 @@ function statusFromActionError(result: Extract<ActionResult<unknown>, { ok: fals
     case "UNDO_CONFLICT":
     case "UNDO_STALE":
     case "PREVIEW_STALE":
+    case "BILLING_PROBE_STALE":
     case "resource.conflict":
       return 409;
     case "UNDO_EXPIRED":
