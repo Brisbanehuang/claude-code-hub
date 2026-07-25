@@ -44,6 +44,7 @@ import {
   ProviderUnifiedTestSchema,
   type ProviderUpdateInput,
   ProviderUpdateSchema,
+  ProviderUsageProbeRequestSchema,
 } from "@/lib/api/v1/schemas/providers";
 import type { ProviderDisplay, ProviderStatistics, ProviderStatisticsMap } from "@/types/provider";
 
@@ -424,6 +425,26 @@ export async function probeProviderBilling(c: Context): Promise<Response> {
       instance: new URL(c.req.url).pathname,
       errorCode: "provider.billing_probe_failed",
       detail: "Provider billing probes could not be completed.",
+    });
+  }
+}
+
+export async function probeProviderUsage(c: Context): Promise<Response> {
+  const body = await parseJson(c, ProviderUsageProbeRequestSchema);
+  if (body instanceof Response) return body;
+  const visibilityError = await ensureVisibleProviderIds(c, body.providerIds);
+  if (visibilityError) return visibilityError;
+  try {
+    const { probeProviderUsageByIds } = await import("@/lib/provider-usage-probe");
+    return jsonResponse(await probeProviderUsageByIds(body.providerIds), {
+      headers: withNoStoreHeaders(),
+    });
+  } catch {
+    return createProblemResponse({
+      status: 500,
+      instance: new URL(c.req.url).pathname,
+      errorCode: "provider.usage_probe_failed",
+      detail: "Provider usage probes could not be completed.",
     });
   }
 }

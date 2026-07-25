@@ -36,6 +36,7 @@ const editProviderMock = vi.hoisted(() => vi.fn());
 const removeProviderMock = vi.hoisted(() => vi.fn());
 const validateAuthTokenMock = vi.hoisted(() => vi.fn());
 const probeProviderBillingByIdsMock = vi.hoisted(() => vi.fn());
+const probeProviderUsageByIdsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/actions/providers", () => ({
   getProviders: getProvidersMock,
@@ -81,6 +82,10 @@ vi.mock("@/lib/auth", async (importOriginal) => {
 
 vi.mock("@/lib/provider-billing-probe", () => ({
   probeProviderBillingByIds: probeProviderBillingByIdsMock,
+}));
+
+vi.mock("@/lib/provider-usage-probe", () => ({
+  probeProviderUsageByIds: probeProviderUsageByIdsMock,
 }));
 
 const { callV1Route } = await import("../test-utils");
@@ -233,6 +238,20 @@ describe("v1 providers read endpoints", () => {
           observedAt: "2026-07-24T12:00:00.000Z",
           probeToken: "pbp1.payload.signature",
           probeExpiresAt: "2026-07-24T12:05:00.000Z",
+        },
+      ],
+    });
+    probeProviderUsageByIdsMock.mockResolvedValue({
+      results: [
+        {
+          providerId: 1,
+          providerName: "Provider 1",
+          status: "ok",
+          remaining: "12.34",
+          unit: "USD",
+          mode: "unrestricted",
+          isActive: true,
+          observedAt: "2026-07-25T12:00:00.000Z",
         },
       ],
     });
@@ -1036,6 +1055,64 @@ describe("v1 providers read endpoints", () => {
       body: { providerIds: [1] },
     });
     expect(unauthorized.response.status).toBe(401);
+  });
+
+  test("probes stored provider usage through an admin-only bounded endpoint", async () => {
+    const probed = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeUsage",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [1, 3] },
+    });
+    expect(probed.response.status).toBe(200);
+    expect(probed.response.headers.get("cache-control")).toContain("no-store");
+    expect(probeProviderUsageByIdsMock).toHaveBeenCalledWith([1, 3]);
+    expect(probed.json).toMatchObject({ results: [{ status: "ok", remaining: "12.34" }] });
+
+    const hidden = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeUsage",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [2] },
+    });
+    expect(hidden.response.status).toBe(404);
+    expect(probeProviderUsageByIdsMock).not.toHaveBeenCalledWith([2]);
+
+    const tooLarge = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeUsage",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: Array.from({ length: 21 }, (_, index) => index + 1) },
+    });
+    expect(tooLarge.response.status).toBe(400);
+
+    const duplicate = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeUsage",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [1, 1] },
+    });
+    expect(duplicate.response.status).toBe(400);
+
+    const unauthorized = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeUsage",
+      body: { providerIds: [1] },
+    });
+    expect(unauthorized.response.status).toBe(401);
+
+    validateAuthTokenMock.mockResolvedValueOnce({
+      ...adminSession,
+      user: { ...adminSession.user, role: "user" },
+    } as AuthSession);
+    const forbidden = await callV1Route({
+      method: "POST",
+      pathname: "/api/v1/providers:probeUsage",
+      headers: { Authorization: "Bearer admin-token" },
+      body: { providerIds: [1] },
+    });
+    expect(forbidden.response.status).toBe(403);
+    expect(probeProviderUsageByIdsMock).not.toHaveBeenCalledWith([1]);
   });
 
   test("exposes provider API test operations", async () => {
