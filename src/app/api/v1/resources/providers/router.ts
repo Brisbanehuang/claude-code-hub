@@ -33,6 +33,8 @@ import {
   ProviderUndoBodySchema,
   ProviderUnifiedTestSchema,
   ProviderUpdateSchema,
+  ProviderUsageProbeRequestSchema,
+  ProviderUsageProbeResponseSchema,
 } from "@/lib/api/v1/schemas/providers";
 import {
   applyBatchPatch,
@@ -53,6 +55,7 @@ import {
   listProviders,
   previewBatchPatch,
   probeProviderBilling,
+  probeProviderUsage,
   reclusterProviderVendors,
   resetProviderCircuit,
   resetProviderCircuitsBatch,
@@ -160,6 +163,34 @@ providersRouter.openapi(
     },
   }),
   probeProviderBilling as never
+);
+
+providersRouter.openapi(
+  createRoute({
+    method: "post",
+    path: "/providers:probeUsage",
+    middleware: requireAuth("admin"),
+    tags: ["Providers"],
+    summary: "Probe provider usage balances",
+    description:
+      "Uses each provider's stored connection settings to read its Sub2API usage balance. Credentials and upstream response bodies are never returned.",
+    "x-required-access": "admin",
+    security,
+    request: {
+      body: {
+        required: true,
+        content: { "application/json": { schema: ProviderUsageProbeRequestSchema } },
+      },
+    },
+    responses: {
+      200: {
+        description: "Per-provider isolated usage probe results.",
+        content: { "application/json": { schema: ProviderUsageProbeResponseSchema } },
+      },
+      ...problemResponses,
+    },
+  }),
+  probeProviderUsage as never
 );
 
 providersRouter.openapi(

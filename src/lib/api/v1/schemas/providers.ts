@@ -252,6 +252,59 @@ export const ProviderBillingProbeResponseSchema = z
   })
   .strict();
 
+export const ProviderUsageProbeRequestSchema = z
+  .object({
+    providerIds: z
+      .array(z.number().int().positive())
+      .min(1)
+      .max(20)
+      .refine((ids) => new Set(ids).size === ids.length, "Provider ids must be unique.")
+      .describe("One to twenty unique provider ids."),
+  })
+  .strict();
+
+const ProviderUsageProbeSuccessSchema = z
+  .object({
+    providerId: z.number().int().positive(),
+    providerName: z.string(),
+    status: z.literal("ok"),
+    remaining: z
+      .string()
+      .regex(/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/)
+      .nullable(),
+    unit: z.string().min(1).max(32).nullable(),
+    mode: z.enum(["quota_limited", "unrestricted"]),
+    isActive: z.boolean(),
+    observedAt: z.string().datetime({ offset: true }),
+  })
+  .refine((value) => (value.remaining === null) === (value.unit === null), {
+    message: "Remaining and unit must both be present or both be null.",
+  })
+  .strict();
+
+const ProviderUsageProbeFailureSchema = z
+  .object({
+    providerId: z.number().int().positive(),
+    providerName: z.string(),
+    status: z.enum([
+      "unsupported",
+      "unauthorized",
+      "timeout",
+      "http_error",
+      "invalid_response",
+      "provider_disabled",
+    ]),
+    errorCode: z.string(),
+    httpStatus: z.number().int().min(100).max(599).optional(),
+  })
+  .strict();
+
+export const ProviderUsageProbeResponseSchema = z
+  .object({
+    results: z.array(z.union([ProviderUsageProbeSuccessSchema, ProviderUsageProbeFailureSchema])),
+  })
+  .strict();
+
 const ProviderBatchUpdateFieldsSchema = z
   .object({
     is_enabled: z.boolean().optional().describe("Provider enabled state."),
