@@ -300,6 +300,7 @@
         "jsonErrorNonEmpty": "JSON has a non-empty `error` field",
         "jsonErrorMessageNonEmpty": "JSON has a non-empty `error.message`",
         "jsonMessageKeywordMatch": "JSON `message` contains the word \"error\" (heuristic)",
+        "openAIResponseFailed": "OpenAI Responses terminal event reports failed",
         "unknown": "Response body indicates an error"
       },
       "statusCodeInferredBadge": "Inferred",

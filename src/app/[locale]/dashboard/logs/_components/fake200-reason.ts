@@ -8,6 +8,7 @@ const FAKE_200_REASON_KEYS: Record<string, string> = {
   FAKE_200_JSON_ERROR_NON_EMPTY: "jsonErrorNonEmpty",
   FAKE_200_JSON_ERROR_MESSAGE_NON_EMPTY: "jsonErrorMessageNonEmpty",
   FAKE_200_JSON_MESSAGE_KEYWORD_MATCH: "jsonMessageKeywordMatch",
+  FAKE_200_OPENAI_RESPONSE_FAILED: "openAIResponseFailed",
 };
 
 export function getFake200ReasonKey(code: string, prefix: string): string {

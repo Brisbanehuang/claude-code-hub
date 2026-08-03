@@ -4,8 +4,20 @@ import createNextIntlPlugin from "next-intl/plugin";
 // Create next-intl plugin with i18n request configuration
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 
+const skipNextTypecheck = process.env.CCH_SKIP_NEXT_TYPECHECK === "1";
+
 const nextConfig: NextConfig = {
   output: "standalone",
+
+  ...(skipNextTypecheck
+    ? {
+        // Docker builds run `tsgo` before `next build`; skip Next's duplicate
+        // typecheck to keep linux/amd64 image builds within local Docker memory.
+        typescript: {
+          ignoreBuildErrors: true,
+        },
+      }
+    : {}),
 
   // 转译 ESM 模块（@lobehub/icons 需要）
   transpilePackages: ["@lobehub/icons"],

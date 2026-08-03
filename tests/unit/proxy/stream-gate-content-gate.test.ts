@@ -156,6 +156,24 @@ describe("runStreamContentGate", () => {
     expect(result.committed).toBe(true);
   });
 
+  it("commits DeepSeek reasoning before the event cap can overflow", async () => {
+    const reasoningFrames = Array.from(
+      { length: 80 },
+      (_, index) =>
+        `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: `step-${index}` } }] })}\n\n`
+    );
+    const reader = readerFromChunks([reasoningFrames.join("")]);
+    const result = await runStreamContentGate(reader, {
+      ...GATE_OPTIONS,
+      family: "openai-chat",
+      prebufferEventCap: 64,
+    });
+
+    expect(result.committed).toBe(true);
+    if (!result.committed) return;
+    expect(result.framesSeen).toBe(1);
+  });
+
   it("fails with prebuffer_overflow when byte cap exceeded", async () => {
     const bigNeutral = `event: ping\ndata: {"type":"ping","pad":"${"x".repeat(4000)}"}\n\n`;
     const reader = readerFromChunks([bigNeutral, bigNeutral, bigNeutral]);

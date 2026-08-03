@@ -300,6 +300,7 @@
         "jsonErrorNonEmpty": "JSON 頂層 error 欄位非空",
         "jsonErrorMessageNonEmpty": "JSON 中 error.message 非空",
         "jsonMessageKeywordMatch": "JSON message 欄位包含 \"error\"（啟發式）",
+        "openAIResponseFailed": "OpenAI Responses 終態事件回報 failed",
         "unknown": "回應本文內容顯示錯誤"
       },
       "statusCodeInferredBadge": "推測",

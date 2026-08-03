@@ -178,6 +178,12 @@ describe("classifyFrame: openai-chat", () => {
     ).toBe("content");
   });
 
+  it("content: reasoning_content delta", () => {
+    expect(
+      classifyFrame("openai-chat", null, '{"choices":[{"delta":{"reasoning_content":"thinking"}}]}')
+    ).toBe("content");
+  });
+
   it("neutral: role-only first chunk / finish_reason-only / usage-only", () => {
     expect(classifyFrame("openai-chat", null, '{"choices":[{"delta":{"role":"assistant"}}]}')).toBe(
       "neutral"
@@ -201,6 +207,9 @@ describe("classifyFrame: openai-chat", () => {
     expect(classifyFrame("openai-chat", null, '{"choices":[{"delta":{"content":""}}]}')).toBe(
       "neutral"
     );
+    expect(
+      classifyFrame("openai-chat", null, '{"choices":[{"delta":{"reasoning_content":""}}]}')
+    ).toBe("neutral");
   });
 
   it("error: in-stream error payload", () => {
