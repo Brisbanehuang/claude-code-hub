@@ -330,7 +330,7 @@ export async function startReplayCleanupScheduler(): Promise<void> {
     const runTick = () => {
       void runReplayCleanupTick().catch((error) => {
         logger.warn("[Instrumentation] Replay cleanup tick failed", {
-          error: error instanceof Error ? error.message : String(error),
+          ...describeSchedulerError(error),
         });
       });
     };

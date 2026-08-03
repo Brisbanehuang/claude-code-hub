@@ -668,14 +668,16 @@ describe("ReplayStore：PG 完成持久层", () => {
     await expect(store.cleanupExpired(cutoff)).resolves.toBe(2);
 
     expect(dbState.executeQueries).toHaveLength(1);
-    const deleteSql = toSqlText(dbState.executeQueries[0]).toLowerCase();
+    const deleteQuery = dialect.sqlToQuery(dbState.executeQueries[0] as SQL);
+    const deleteSql = deleteQuery.sql.toLowerCase();
     expect(deleteSql).toContain("with doomed as");
-    expect(deleteSql).toContain("expires_at < $1");
+    expect(deleteSql).toContain("expires_at < $1::timestamptz");
     expect(deleteSql).toContain("order by expires_at, replay_id");
     expect(deleteSql).toContain("limit $2");
     expect(deleteSql).toContain("for update skip locked");
     expect(deleteSql).toContain("delete from replay_payloads");
     expect(deleteSql).toContain("returning 1");
+    expect(deleteQuery.params).toEqual([cutoff.toISOString(), 100]);
   });
 
   it("findCompleted 只按 replayId + 未过期条件查询并返回首行", async () => {

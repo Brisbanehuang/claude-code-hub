@@ -430,11 +430,15 @@ export class ReplayStore {
 
   /** 删除单批 PG 持久层过期行；返回删除数（错误由调用方处理）。 */
   async cleanupExpired(cutoff = new Date()): Promise<number> {
+    // Raw Drizzle SQL parameters do not apply the timestamp column encoder.
+    // Pass an ISO string explicitly so newer Node runtimes do not forward a
+    // Date object into postgres.js' text parameter serializer.
+    const cutoffIso = cutoff.toISOString();
     const deleted = await db.execute(sql`
       WITH doomed AS (
         SELECT replay_id
         FROM replay_payloads
-        WHERE expires_at < ${cutoff}
+        WHERE expires_at < ${cutoffIso}::timestamptz
         ORDER BY expires_at, replay_id
         LIMIT ${REPLAY_CLEANUP_BATCH_SIZE}
         FOR UPDATE SKIP LOCKED
